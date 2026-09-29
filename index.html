@@ -87,12 +87,35 @@
       return { key: k, value: r };
     },
     set: async function (k, v) {
+      var fullKey = "rl:" + k;
       try {
-        localStorage.setItem("rl:" + k, v);
+        localStorage.setItem(fullKey, v);
         return { key: k, value: v };
       } catch (e) {
-        console.error("LocalStorage set error:", e);
-        throw e;
+        console.warn("LocalStorage quota error, attempting auto-prune of old cached months:", e);
+        try {
+          var keysToRemove = [];
+          for (var i = 0; i < localStorage.length; i++) {
+            var lk = localStorage.key(i);
+            if (lk && lk.startsWith("rl:entries:")) {
+              keysToRemove.push(lk);
+            }
+          }
+          keysToRemove.sort();
+          for (var j = 0; j < keysToRemove.length; j++) {
+            if (keysToRemove[j] !== fullKey) {
+              localStorage.removeItem(keysToRemove[j]);
+              try {
+                localStorage.setItem(fullKey, v);
+                console.log("Auto-pruned " + keysToRemove[j] + " successfully!");
+                return { key: k, value: v };
+              } catch(retryErr) {}
+            }
+          }
+          return { key: k, value: v, warning: "storage_quota_exceeded" };
+        } catch(pruneErr) {
+          return { key: k, value: v, warning: "storage_quota_exceeded" };
+        }
       }
     },
     delete: async function (k) {
@@ -106,7 +129,7 @@
     });
   }
 
-  // ── Firebase Realtime Database Config & Multi-Device Sync Engine ──
+  // ── Firebase Realtime Database Config & Multi-Device Offline Sync Engine ──
   var FIREBASE_DB_URL = "https://banahaw-food-park-default-rtdb.firebaseio.com";
   var FIREBASE_RECORD_PATH = "banahaw_food_park";
   var ACTIVITY_LOG_MAX = 300;
@@ -178,6 +201,7 @@
           rentAmount: localDay.rentAmount != null ? localDay.rentAmount : remoteDay.rentAmount,
           motherShare: localDay.motherShare != null ? localDay.motherShare : remoteDay.motherShare,
           aykaShare: localDay.aykaShare != null ? localDay.aykaShare : remoteDay.aykaShare,
+          amountPaid: localDay.amountPaid != null ? localDay.amountPaid : remoteDay.amountPaid,
           datePaid: localDay.datePaid || remoteDay.datePaid,
           coveredDate: localDay.coveredDate || remoteDay.coveredDate,
           remarks: localDay.remarks || remoteDay.remarks,
@@ -188,8 +212,44 @@
     return merged;
   }
 
+  // Offline Outbox Queue management
+  function addToOutbox(key, val) {
+    try {
+      var raw = localStorage.getItem("rl:outbox_queue");
+      var queue = raw ? JSON.parse(raw) : [];
+      queue.push({ key: key, val: val, ts: new Date().toISOString() });
+      localStorage.setItem("rl:outbox_queue", JSON.stringify(queue));
+    } catch(e) {}
+  }
+
+  async function flushOutbox() {
+    try {
+      var raw = localStorage.getItem("rl:outbox_queue");
+      if (!raw) return;
+      var queue = JSON.parse(raw);
+      if (!queue || queue.length === 0) return;
+      var remaining = [];
+      for (var i = 0; i < queue.length; i++) {
+        var item = queue[i];
+        var ok = await syncKeyToCloud(item.key, item.val);
+        if (!ok) {
+          remaining.push(item);
+        }
+      }
+      if (remaining.length > 0) {
+        localStorage.setItem("rl:outbox_queue", JSON.stringify(remaining));
+      } else {
+        localStorage.removeItem("rl:outbox_queue");
+      }
+    } catch(e) {}
+  }
+
+  window.addEventListener("online", flushOutbox);
+  setInterval(flushOutbox, 10000);
+
   // Backup all local keys up to Firebase
   async function cloudBackup() {
+    await flushOutbox();
     var data = {};
     var records = {};
     for (var i = 0; i < localStorage.length; i++) {
@@ -202,21 +262,12 @@
       }
     }
     var nowIso = new Date().toISOString();
-    // PATCH merges per record: it never deletes records that this device does not have
-    if (Object.keys(records).length > 0) {
-      var res = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + "/records.json", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(records)
-      });
-      if (!res.ok) throw new Error("Firebase write failed: " + res.status);
-    }
-    var res2 = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + ".json", {
-      method: "PATCH",
+    var res = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + ".json", {
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lastBackup: nowIso })
+      body: JSON.stringify({ data: data, records: records, lastBackup: nowIso })
     });
-    if (!res2.ok) throw new Error("Firebase write failed: " + res2.status);
+    if (!res.ok) throw new Error("Firebase write failed: " + res.status);
     return true;
   }
 
@@ -256,7 +307,10 @@
   // Auto-backup debouncer
   function autoBackupToCloud(specificKey, specificVal) {
     if (specificKey && specificVal !== undefined) {
-      syncKeyToCloud(specificKey, specificVal);
+      addToOutbox(specificKey, specificVal);
+      syncKeyToCloud(specificKey, specificVal).then(function(ok) {
+        if (ok) flushOutbox();
+      });
     }
     clearTimeout(window._autoBackupTimer);
     window._autoBackupTimer = setTimeout(function() {
@@ -363,10 +417,12 @@ function doBackup() {
 }
 
 function rowRent(e, s) { if (e.rentAmount != null) return Number(e.rentAmount); if (e.status === 'present') return Number(s.presentFee) || 0; if (e.status === 'absent') return Number(s.absentFee) || 0; return 0; }
-function rowMother(e, s) { if (e.motherShare != null) return Number(e.motherShare); if (e.status === 'present') return s.presentMotherShare != null ? Number(s.presentMotherShare) : (Number(s.presentFee) || 0); if (e.status === 'absent') return s.absentMotherShare != null ? Number(s.absentMotherShare) : (Number(s.absentFee) || 0); return 0; }
-function rowAyka(e, s) { if (e.aykaShare != null) return Number(e.aykaShare); if (e.status === 'present') return s.presentAykaShare != null ? Number(s.presentAykaShare) : 0; if (e.status === 'absent') return s.absentAykaShare != null ? Number(s.absentAykaShare) : 0; return 0; }
+function rowAyka(e, s) { if (e.aykaShare != null) return Number(e.aykaShare); if (e.status === 'present') return s.presentAykaShare != null ? Number(s.presentAykaShare) : Math.round((Number(s.presentFee) || 0) * 0.7); if (e.status === 'absent') return s.absentAykaShare != null ? Number(s.absentAykaShare) : Math.round((Number(s.absentFee) || 0) * 0.7); return 0; }
+function rowMother(e, s) { if (e.motherShare != null) return Number(e.motherShare); if (e.status === 'present') return s.presentMotherShare != null ? Number(s.presentMotherShare) : ((Number(s.presentFee) || 0) - rowAyka(e, s)); if (e.status === 'absent') return s.absentMotherShare != null ? Number(s.absentMotherShare) : ((Number(s.absentFee) || 0) - rowAyka(e, s)); return 0; }
 function rowGarb(e) { return e.status === "present" ? GARBAGE : 0; }
 function rowTot(e, s) { return rowRent(e, s) + rowGarb(e); }
+function rowPaid(e, s) { if (!e.status) return 0; if (e.amountPaid != null) return Number(e.amountPaid); if (e.signature) return rowTot(e, s); return 0; }
+function rowBal(e, s) { if (!e.status) return 0; var tot = rowTot(e, s); var pd = rowPaid(e, s); return Math.max(0, tot - pd); }
 
 function LockScreen({ onUnlock }) {
   const [pin, setPin] = useState("");
@@ -507,11 +563,11 @@ function TenantModal({ tenant, category, onSave, onClose }) {
   const isEdit = !!tenant;
   const [name, setName] = useState(tenant ? tenant.name : "");
   const [pf, setPf] = useState(tenant ? String(tenant.presentFee) : "");
-  const [pmf, setPmf] = useState(tenant ? String(tenant.presentMotherShare != null ? tenant.presentMotherShare : tenant.presentFee) : "");
-  const [paf, setPaf] = useState(tenant ? String(tenant.presentAykaShare != null ? tenant.presentAykaShare : 0) : "");
+  const [pmf, setPmf] = useState(tenant ? String(tenant.presentMotherShare != null ? tenant.presentMotherShare : ((Number(tenant.presentFee)||0) - (tenant.presentAykaShare != null ? tenant.presentAykaShare : Math.round((Number(tenant.presentFee)||0)*0.7)))) : "");
+  const [paf, setPaf] = useState(tenant ? String(tenant.presentAykaShare != null ? tenant.presentAykaShare : Math.round((Number(tenant.presentFee)||0)*0.7)) : "");
   const [af, setAf] = useState(tenant ? String(tenant.absentFee) : "");
-  const [amf, setAmf] = useState(tenant ? String(tenant.absentMotherShare != null ? tenant.absentMotherShare : tenant.absentFee) : "");
-  const [aaf, setAaf] = useState(tenant ? String(tenant.absentAykaShare != null ? tenant.absentAykaShare : 0) : "");
+  const [amf, setAmf] = useState(tenant ? String(tenant.absentMotherShare != null ? tenant.absentMotherShare : ((Number(tenant.absentFee)||0) - (tenant.absentAykaShare != null ? tenant.absentAykaShare : Math.round((Number(tenant.absentFee)||0)*0.7)))) : "");
+  const [aaf, setAaf] = useState(tenant ? String(tenant.absentAykaShare != null ? tenant.absentAykaShare : Math.round((Number(tenant.absentFee)||0)*0.7)) : "");
   const [ownerName, setOwnerName] = useState(tenant ? (tenant.ownerName || "") : "");
   const [ownerPhone, setOwnerPhone] = useState(tenant ? (tenant.ownerPhone || "") : "");
   const [startDate, setStartDate] = useState(tenant ? (tenant.startDate || "") : "");
@@ -521,9 +577,10 @@ function TenantModal({ tenant, category, onSave, onClose }) {
     setPf(val);
     setErr("");
     const num = Number(val) || 0;
-    if (num > 0 && (!tenant || tenant.presentMotherShare == null)) {
-      setPmf(String(Math.round(num * 0.7)));
-      setPaf(String(num - Math.round(num * 0.7)));
+    if (num > 0 && (!tenant || tenant.presentAykaShare == null)) {
+      const ayka = Math.round(num * 0.7);
+      setPaf(String(ayka));
+      setPmf(String(num - ayka));
     }
   };
 
@@ -531,9 +588,10 @@ function TenantModal({ tenant, category, onSave, onClose }) {
     setAf(val);
     setErr("");
     const num = Number(val) || 0;
-    if (num > 0 && (!tenant || tenant.absentMotherShare == null)) {
-      setAmf(String(Math.round(num * 0.7)));
-      setAaf(String(num - Math.round(num * 0.7)));
+    if (num > 0 && (!tenant || tenant.absentAykaShare == null)) {
+      const ayka = Math.round(num * 0.7);
+      setAaf(String(ayka));
+      setAmf(String(num - ayka));
     }
   };
 
@@ -558,6 +616,14 @@ function TenantModal({ tenant, category, onSave, onClose }) {
     });
   };
 
+  const pSum = (Number(pmf) || 0) + (Number(paf) || 0);
+  const pTot = Number(pf) || 0;
+  const pDiff = pSum !== pTot;
+
+  const aSum = (Number(amf) || 0) + (Number(aaf) || 0);
+  const aTot = Number(af) || 0;
+  const aDiff = aSum !== aTot;
+
   return (
     <div className="modal-backdrop" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 90, padding: 16 }} onClick={onClose}>
       <div className="modal-content" style={{ background: "#fff", borderRadius: 14, padding: 24, width: 480, maxWidth: "100%", boxShadow: "0 20px 60px rgba(0,0,0,0.25)", maxHeight: "90vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
@@ -570,30 +636,35 @@ function TenantModal({ tenant, category, onSave, onClose }) {
           <input value={name} onChange={(e) => { setName(e.target.value); setErr(""); }} placeholder="e.g. Kamchies Mixed Fruits"
             style={{ width: "100%", padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 14, marginBottom: 14 }} />
 
-          <div style={{ marginBottom: 14, padding: 12, border: `1px solid ${C.borderL}`, borderRadius: 10, background: C.paper }}>
+          <div style={{ marginBottom: 14, padding: 12, border: `1px solid ${pDiff ? '#F5C6C2' : C.borderL}`, borderRadius: 10, background: pDiff ? '#FFF5F5' : C.paper }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.green, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.8 }}>
               Daily Rent Breakdown — PRESENT (₱)
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
               <div>
                 <label style={{ fontSize: 10, fontWeight: 600, color: C.inkS, display: "block", marginBottom: 3 }}>Total Rent</label>
-                <input type="number" min="0" value={pf} onChange={(e) => handlePfChange(e.target.value)} placeholder="e.g. 360"
+                <input type="number" min="0" value={pf} onChange={(e) => handlePfChange(e.target.value)} placeholder="e.g. 350"
                   style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, fontWeight: 600 }} />
               </div>
               <div>
-                <label style={{ fontSize: 10, fontWeight: 600, color: C.navy, display: "block", marginBottom: 3 }}>Mother Share</label>
-                <input type="number" min="0" value={pmf} onChange={(e) => { setPmf(e.target.value); setErr(""); }} placeholder="e.g. 250"
+                <label style={{ fontSize: 10, fontWeight: 600, color: C.gold, display: "block", marginBottom: 3 }}>Ate Ayka Share</label>
+                <input type="number" min="0" value={paf} onChange={(e) => { setPaf(e.target.value); setErr(""); }} placeholder="e.g. 300"
                   style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
               </div>
               <div>
-                <label style={{ fontSize: 10, fontWeight: 600, color: C.gold, display: "block", marginBottom: 3 }}>Ate Ayka Share</label>
-                <input type="number" min="0" value={paf} onChange={(e) => { setPaf(e.target.value); setErr(""); }} placeholder="e.g. 110"
+                <label style={{ fontSize: 10, fontWeight: 600, color: C.navy, display: "block", marginBottom: 3 }}>Mother Share</label>
+                <input type="number" min="0" value={pmf} onChange={(e) => { setPmf(e.target.value); setErr(""); }} placeholder="e.g. 50"
                   style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
               </div>
             </div>
+            {pDiff && pf !== "" && (
+              <div style={{ fontSize: 11, color: C.red, marginTop: 6, fontWeight: 500 }}>
+                ⚠️ Ate Ayka ({paf || 0}) + Mother ({pmf || 0}) = {pSum}, di tugma sa Total Rent ({pTot}).
+              </div>
+            )}
           </div>
 
-          <div style={{ marginBottom: 14, padding: 12, border: `1px solid ${C.borderL}`, borderRadius: 10, background: C.paper }}>
+          <div style={{ marginBottom: 14, padding: 12, border: `1px solid ${aDiff ? '#F5C6C2' : C.borderL}`, borderRadius: 10, background: aDiff ? '#FFF5F5' : C.paper }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: C.navy, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.8 }}>
               Daily Rent Breakdown — ABSENT (₱)
             </div>
@@ -602,6 +673,7 @@ function TenantModal({ tenant, category, onSave, onClose }) {
                 <label style={{ fontSize: 10, fontWeight: 600, color: C.inkS, display: "block", marginBottom: 3 }}>Total Rent</label>
                 <input type="number" min="0" value={af} onChange={(e) => handleAfChange(e.target.value)} placeholder="e.g. 200"
                   style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, fontWeight: 600 }} />
+              </div>
               </div>
               <div>
                 <label style={{ fontSize: 10, fontWeight: 600, color: C.navy, display: "block", marginBottom: 3 }}>Mother Share</label>
@@ -807,8 +879,10 @@ function DeleteTenantModal({ tenant, onConfirm, onClose }) {
 function DayDetailsModal({ day, dateStr, tenant, entry, onSave, onClose }) {
   const [status, setStatus] = useState(entry.status || null);
   const [rent, setRent] = useState(String(entry.rentAmount != null ? entry.rentAmount : (status === "present" ? tenant.presentFee : (status === "absent" ? tenant.absentFee : ""))));
-  const [mother, setMother] = useState(String(entry.motherShare != null ? entry.motherShare : (status === "present" ? (tenant.presentMotherShare != null ? tenant.presentMotherShare : tenant.presentFee) : (status === "absent" ? (tenant.absentMotherShare != null ? tenant.absentMotherShare : tenant.absentFee) : ""))));
-  const [ayka, setAyka] = useState(String(entry.aykaShare != null ? entry.aykaShare : (status === "present" ? (tenant.presentAykaShare != null ? tenant.presentAykaShare : 0) : (status === "absent" ? (tenant.absentAykaShare != null ? tenant.absentAykaShare : 0) : ""))));
+  const [ayka, setAyka] = useState(String(entry.aykaShare != null ? entry.aykaShare : (status === "present" ? (tenant.presentAykaShare != null ? tenant.presentAykaShare : Math.round((Number(tenant.presentFee)||0)*0.7)) : (status === "absent" ? (tenant.absentAykaShare != null ? tenant.absentAykaShare : Math.round((Number(tenant.absentFee)||0)*0.7)) : ""))));
+  const [mother, setMother] = useState(String(entry.motherShare != null ? entry.motherShare : (status === "present" ? (tenant.presentMotherShare != null ? tenant.presentMotherShare : ((Number(tenant.presentFee)||0)-Number(ayka))) : (status === "absent" ? (tenant.absentMotherShare != null ? tenant.absentMotherShare : ((Number(tenant.absentFee)||0)-Number(ayka))) : ""))));
+  const defaultPaid = entry.amountPaid != null ? String(entry.amountPaid) : (entry.signature ? String((Number(rent)||0) + (status === "present" ? GARBAGE : 0)) : "");
+  const [amountPaid, setAmountPaid] = useState(defaultPaid);
   const [coveredDate, setCoveredDate] = useState(entry.coveredDate || dateStr);
   const [datePaid, setDatePaid] = useState(entry.datePaid || new Date().toISOString().slice(0, 10));
   const [remarks, setRemarks] = useState(entry.remarks || "");
@@ -816,17 +890,25 @@ function DayDetailsModal({ day, dateStr, tenant, entry, onSave, onClose }) {
   const handleStatusSelect = (st) => {
     setStatus(st);
     if (st === "present") {
-      setRent(String(tenant.presentFee));
-      setMother(String(tenant.presentMotherShare != null ? tenant.presentMotherShare : tenant.presentFee));
-      setAyka(String(tenant.presentAykaShare != null ? tenant.presentAykaShare : 0));
+      const r = tenant.presentFee;
+      const a = tenant.presentAykaShare != null ? tenant.presentAykaShare : Math.round(r * 0.7);
+      const m = tenant.presentMotherShare != null ? tenant.presentMotherShare : (r - a);
+      setRent(String(r)); setAyka(String(a)); setMother(String(m));
+      if (!amountPaid) setAmountPaid(String(r + GARBAGE));
     } else if (st === "absent") {
-      setRent(String(tenant.absentFee));
-      setMother(String(tenant.absentMotherShare != null ? tenant.absentMotherShare : tenant.absentFee));
-      setAyka(String(tenant.absentAykaShare != null ? tenant.absentAykaShare : 0));
+      const r = tenant.absentFee;
+      const a = tenant.absentAykaShare != null ? tenant.absentAykaShare : Math.round(r * 0.7);
+      const m = tenant.absentMotherShare != null ? tenant.absentMotherShare : (r - a);
+      setRent(String(r)); setAyka(String(a)); setMother(String(m));
+      if (!amountPaid) setAmountPaid(String(r));
     } else {
-      setRent(""); setMother(""); setAyka("");
+      setRent(""); setMother(""); setAyka(""); setAmountPaid("");
     }
   };
+
+  const currentTotal = (Number(rent) || 0) + (status === "present" ? GARBAGE : 0);
+  const currentPaid = amountPaid !== "" ? Number(amountPaid) : (entry.signature ? currentTotal : 0);
+  const currentBal = Math.max(0, currentTotal - currentPaid);
 
   const submit = (e) => {
     e.preventDefault();
@@ -835,6 +917,7 @@ function DayDetailsModal({ day, dateStr, tenant, entry, onSave, onClose }) {
       rentAmount: rent !== "" ? Number(rent) : undefined,
       motherShare: mother !== "" ? Number(mother) : undefined,
       aykaShare: ayka !== "" ? Number(ayka) : undefined,
+      amountPaid: amountPaid !== "" ? Number(amountPaid) : undefined,
       coveredDate: coveredDate,
       datePaid: datePaid,
       remarks: remarks.trim()
@@ -863,21 +946,35 @@ function DayDetailsModal({ day, dateStr, tenant, entry, onSave, onClose }) {
 
           <div style={{ padding: 12, border: `1px solid ${C.borderL}`, borderRadius: 10, background: C.paper, marginBottom: 14 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: C.navy, marginBottom: 8, textTransform: "uppercase" }}>Rent Payment Breakdown (₱)</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
               <div>
                 <label style={{ fontSize: 10, fontWeight: 600, color: C.inkS, display: "block", marginBottom: 3 }}>Total Rent</label>
                 <input type="number" min="0" value={rent} onChange={(e) => setRent(e.target.value)} placeholder="0"
                   style={{ width: "100%", padding: "7px 8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, fontWeight: 600 }} />
               </div>
               <div>
+                <label style={{ fontSize: 10, fontWeight: 600, color: C.gold, display: "block", marginBottom: 3 }}>Ate Ayka Share</label>
+                <input type="number" min="0" value={ayka} onChange={(e) => setAyka(e.target.value)} placeholder="0"
+                  style={{ width: "100%", padding: "7px 8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
+              </div>
+              <div>
                 <label style={{ fontSize: 10, fontWeight: 600, color: C.navy, display: "block", marginBottom: 3 }}>Mother Share</label>
                 <input type="number" min="0" value={mother} onChange={(e) => setMother(e.target.value)} placeholder="0"
                   style={{ width: "100%", padding: "7px 8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
               </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, paddingTop: 8, borderTop: `1px dashed ${C.border}` }}>
               <div>
-                <label style={{ fontSize: 10, fontWeight: 600, color: C.gold, display: "block", marginBottom: 3 }}>Ate Ayka Share</label>
-                <input type="number" min="0" value={ayka} onChange={(e) => setAyka(e.target.value)} placeholder="0"
-                  style={{ width: "100%", padding: "7px 8px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
+                <label style={{ fontSize: 10, fontWeight: 700, color: C.green, display: "block", marginBottom: 3 }}>Amount Paid (Naibayad)</label>
+                <input type="number" min="0" value={amountPaid} onChange={(e) => setAmountPaid(e.target.value)} placeholder={`e.g. ${currentTotal}`}
+                  style={{ width: "100%", padding: "7px 8px", border: `1px solid ${C.green}`, borderRadius: 6, fontSize: 13, fontWeight: 700, color: C.green }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 10, fontWeight: 700, color: currentBal > 0 ? C.red : C.inkS, display: "block", marginBottom: 3 }}>Remaining Balance</label>
+                <div style={{ padding: "7px 8px", background: currentBal > 0 ? C.redBg : "#fff", border: `1px solid ${currentBal > 0 ? C.red : C.border}`, borderRadius: 6, fontSize: 13, fontWeight: 700, color: currentBal > 0 ? C.red : C.navy }}>
+                  ₱{currentBal.toFixed(2)}
+                </div>
               </div>
             </div>
           </div>
@@ -1712,10 +1809,19 @@ function CategoryReport({ category, onBack }) {
 
   const getEntries = async (tenant) => {
     const key = `entries:${tenant.category}:${tenant.id}:${year}-${pad(month)}`;
+    let localData = {};
     try {
       const r = await window.storage.get(key);
-      return r && r.value ? JSON.parse(r.value) : {};
-    } catch (ex) { return {}; }
+      if (r && r.value) localData = JSON.parse(r.value);
+    } catch (ex) {}
+    try {
+      const cloudData = await fetchKeyFromCloud(key);
+      if (cloudData) {
+        localData = mergeEntries(localData, cloudData);
+        window.storage.set(key, JSON.stringify(localData)).catch(function(){});
+      }
+    } catch(e) {}
+    return localData;
   };
 
   const [tenantTotals, setTenantTotals] = useState([]);
@@ -1728,62 +1834,95 @@ function CategoryReport({ category, onBack }) {
       for (var ti = 0; ti < tenantsList.length; ti++) {
         var t = tenantsList[ti];
         const entries = await getEntries(t);
-        var presentC = 0, absentC = 0, totalDue = 0, signedC = 0, motherTotal = 0, aykaTotal = 0;
+        var presentC = 0, absentC = 0, signedC = 0;
+        var rentSum = 0, aykaSum = 0, motherSum = 0, garbSum = 0, totalDue = 0, paidSum = 0, balSum = 0;
         var dayData = [];
         activeDays.forEach(function(d) {
           const e = entries[dk(year, month, d)] || { status: null, signature: null };
-          const rent = rowRent(e, t), garb = rowGarb(e), mShare = rowMother(e, t), aShare = rowAyka(e, t);
-          if (e.signature) { totalDue += rent + garb; motherTotal += mShare; aykaTotal += aShare; }
+          const rent = rowRent(e, t);
+          const ayka = rowAyka(e, t);
+          const mother = rowMother(e, t);
+          const garb = rowGarb(e);
+          const tot = rent + garb;
+          const paid = rowPaid(e, t);
+          const bal = rowBal(e, t);
+
           if (e.status === "present") presentC++;
           else if (e.status === "absent") absentC++;
           if (e.signature) signedC++;
+
+          if (e.status) {
+            rentSum += rent;
+            aykaSum += ayka;
+            motherSum += mother;
+            garbSum += garb;
+            totalDue += tot;
+            paidSum += paid;
+            balSum += bal;
+          }
+
           const dObj = new Date(year, month - 1, d);
-          dayData.push({ day: d, weekday: dObj.toLocaleDateString("en-PH", { weekday: "short" }), status: e.status, rent: rent, mother: mShare, ayka: aShare, garb: garb, total: rent + garb, signed: !!e.signature });
+          dayData.push({
+            day: d,
+            weekday: dObj.toLocaleDateString("en-PH", { weekday: "short" }),
+            status: e.status,
+            rent: rent,
+            ayka: ayka,
+            mother: mother,
+            garb: garb,
+            total: tot,
+            paid: paid,
+            bal: bal,
+            signed: !!e.signature
+          });
         });
-        results.push({ ...t, presentC: presentC, absentC: absentC, totalDue: totalDue, motherTotal: motherTotal, aykaTotal: aykaTotal, signedC: signedC, days: activeDays.length, dayData: dayData });
+        results.push({
+          ...t,
+          presentC, absentC, signedC,
+          rentSum, aykaSum, motherSum, garbSum, totalDue, paidSum, balSum,
+          days: activeDays.length, dayData
+        });
       }
       setTenantTotals(results);
     })();
   }, [loaded, tenants, year, month, fromDay, toDay, useDateRange]);
 
   const grandTotal = tenantTotals.reduce((s, t) => s + t.totalDue, 0);
+  const grandAyka = tenantTotals.reduce((s, t) => s + t.aykaSum, 0);
+  const grandMother = tenantTotals.reduce((s, t) => s + t.motherSum, 0);
+  const grandGarb = tenantTotals.reduce((s, t) => s + t.garbSum, 0);
+  const grandPaid = tenantTotals.reduce((s, t) => s + t.paidSum, 0);
+  const grandBal = tenantTotals.reduce((s, t) => s + t.balSum, 0);
   const totalPresent = tenantTotals.reduce((s, t) => s + t.presentC, 0);
   const totalAbsent = tenantTotals.reduce((s, t) => s + t.absentC, 0);
-  const grandMother = tenantTotals.reduce((s, t) => s + (t.motherTotal || 0), 0);
-  const grandAyka = tenantTotals.reduce((s, t) => s + (t.aykaTotal || 0), 0);
-  const rangeLabel = useDateRange ? `${MONTHS[month - 1]} ${fromDay} - ${toDay}, ${year}` : `${MONTHS[month - 1]} 1 - ${numDays}, ${year}`;
 
   const downloadCategoryPdf = () => {
     const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
-    const pw = 210, ph = 297, ml = 20, mr = 20;
-    let y = 20;
+    const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+    const pw = 297, ph = 210, ml = 15, mr = 15;
+    let y = 16;
 
     doc.setTextColor(27, 42, 74);
     doc.setFont("helvetica", "bold");
-    doc.setFontSize(20);
+    doc.setFontSize(18);
     doc.text("BANAHAW FOOD PARK", pw / 2, y, { align: "center" });
-    y += 7;
+    y += 6;
     doc.setFontSize(9);
     doc.setFont("helvetica", "normal");
     doc.setTextColor(120, 115, 105);
     doc.text("Brgy. Ibabang Iyam, Lucena City", pw / 2, y, { align: "center" });
-    y += 6;
+    y += 5;
     doc.setDrawColor(27, 42, 74);
     doc.setLineWidth(0.6);
     doc.line(ml, y, pw - mr, y);
-    y += 10;
+    y += 8;
 
     doc.setTextColor(27, 42, 74);
     doc.setFont("helvetica", "bold");
-    doc.setFontSize(14);
-    doc.text(`${categoryLabel(category).toUpperCase()} — ${MONTHS[month - 1].toUpperCase()} ${year}`, pw / 2, y, { align: "center" });
-    y += 6;
-    doc.setFontSize(9);
-    doc.setFont("helvetica", "normal");
-    doc.setTextColor(100, 100, 100);
-    doc.text(`Total Payment Report Per Tenant  |  ${rangeLabel}`, pw / 2, y, { align: "center" });
-    y += 10;
+    doc.setFontSize(13);
+    const periodText = useDateRange ? `${MONTHS[month-1]} ${fromDay}-${toDay}, ${year}` : `${MONTHS[month-1]} ${year}`;
+    doc.text(`${categoryLabel(category).toUpperCase()} — CATEGORY REPORT (${periodText})`, pw / 2, y, { align: "center" });
+    y += 8;
 
     const rows = tenantTotals.map((t, i) => [
       i + 1,
@@ -1791,41 +1930,44 @@ function CategoryReport({ category, onBack }) {
       t.ownerName || "—",
       t.presentC,
       t.absentC,
-      t.signedC,
-      pesoPdf(t.motherTotal || 0),
-      pesoPdf(t.aykaTotal || 0),
-      pesoPdf(t.totalDue)
+      pesoPdf(t.aykaSum),
+      pesoPdf(t.motherSum),
+      pesoPdf(t.garbSum),
+      pesoPdf(t.totalDue),
+      pesoPdf(t.paidSum),
+      pesoPdf(t.balSum)
     ]);
-    rows.push(["", "GRAND TOTAL", "", totalPresent, totalAbsent, tenantTotals.reduce((a, t) => a + t.signedC, 0), pesoPdf(grandMother), pesoPdf(grandAyka), pesoPdf(grandTotal)]);
+
+    rows.push([
+      "TOTAL",
+      `GRAND TOTAL (${tenantTotals.length} Tenants)`,
+      "",
+      totalPresent,
+      totalAbsent,
+      pesoPdf(grandAyka),
+      pesoPdf(grandMother),
+      pesoPdf(grandGarb),
+      pesoPdf(grandTotal),
+      pesoPdf(grandPaid),
+      pesoPdf(grandBal)
+    ]);
 
     doc.autoTable({
-      startY: y, margin: { left: 12, right: 12 },
-      head: [["#", "Business Name", "Owner", "Present", "Absent", "Signed", "Kay Mother", "Kay Ate Ayka", "Total Due"]],
+      startY: y, margin: { left: ml, right: mr },
+      head: [["#", "Business Name", "Owner", "Present", "Absent", "Ayka Share", "Mother Share", "Garbage", "Total Due", "Paid", "Balance"]],
       body: rows,
-      styles: { fontSize: 8, cellPadding: 3 },
+      styles: { fontSize: 8.5, cellPadding: 3 },
       headStyles: { fillColor: [27, 42, 74], textColor: [255, 255, 255], fontStyle: "bold" },
       alternateRowStyles: { fillColor: [248, 246, 240] },
-      columnStyles: { 0: { cellWidth: 8 }, 6: { halign: "right" }, 7: { halign: "right" }, 8: { halign: "right", fontStyle: "bold" } },
-      didParseCell: function (data) { if (data.section === "body" && data.row.index === rows.length - 1) { data.cell.styles.fontStyle = "bold"; data.cell.styles.fillColor = [244, 232, 200]; } }
+      columnStyles: { 0: { cellWidth: 10 }, 5: { halign: "right" }, 6: { halign: "right" }, 7: { halign: "right" }, 8: { halign: "right", fontStyle: "bold" }, 9: { halign: "right" }, 10: { halign: "right", fontStyle: "bold" } }
     });
-
-    let fy = doc.lastAutoTable.finalY || y;
-    fy += 10;
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(11);
-    doc.setTextColor(27, 42, 74);
-    doc.text(`TOTAL KAY MOTHER: ${pesoPdf(grandMother)}`, pw - 12, fy, { align: "right" });
-    fy += 7;
-    doc.text(`TOTAL KAY ATE AYKA: ${pesoPdf(grandAyka)}`, pw - 12, fy, { align: "right" });
-    fy += 7;
-    doc.text(`GRAND TOTAL: ${pesoPdf(grandTotal)}`, pw - 12, fy, { align: "right" });
 
     doc.setFontSize(7);
     doc.setTextColor(180, 175, 168);
-    doc.text("Banahaw Food Park  |  Brgy. Ibabang Iyam, Lucena City", ml, ph - 12);
-    doc.text(new Date().toLocaleDateString("en-PH"), pw - mr, ph - 12, { align: "right" });
+    doc.text("Banahaw Food Park  |  Brgy. Ibabang Iyam, Lucena City", ml, ph - 10);
+    doc.text(new Date().toLocaleDateString("en-PH"), pw - mr, ph - 10, { align: "right" });
 
-    doc.save(`${categoryLabel(category)}_${MONTHS[month - 1]}_${year}_Report.pdf`);
+    doc.save(`${categoryLabel(category)}_${MONTHS[month - 1]}_${year}_CategoryReport.pdf`);
   };
 
   const changeMonth = (delta) => { let m = month + delta, y = year; if (m > 12) { m = 1; y++; } else if (m < 1) { m = 12; y--; } setMonth(m); setYear(y); setFromDay(1); setToDay(dim(y, m)); };
@@ -1874,71 +2016,81 @@ function CategoryReport({ category, onBack }) {
           </div>
         )}
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 20 }}>
-          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "14px 16px", textAlign: "center" }}>
-            <div style={{ fontSize: 10, fontWeight: 600, color: C.inkS, textTransform: "uppercase", letterSpacing: 0.5 }}>Kay Mother</div>
-            <div style={{ fontSize: 22, fontWeight: 700, color: C.navy, fontFamily: "'DM Serif Display', Georgia, serif" }}>{peso(grandMother)}</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 10, marginBottom: 20 }}>
+          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "12px 14px", textAlign: "center" }}>
+            <div style={{ fontSize: 10, fontWeight: 600, color: C.inkS, textTransform: "uppercase" }}>Total Due</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: C.navy, fontFamily: "'JetBrains Mono', monospace" }}>{peso(grandTotal)}</div>
           </div>
-          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "14px 16px", textAlign: "center" }}>
-            <div style={{ fontSize: 10, fontWeight: 600, color: C.gold, textTransform: "uppercase", letterSpacing: 0.5 }}>Kay Ate Ayka</div>
-            <div style={{ fontSize: 22, fontWeight: 700, color: C.gold, fontFamily: "'DM Serif Display', Georgia, serif" }}>{peso(grandAyka)}</div>
+          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "12px 14px", textAlign: "center" }}>
+            <div style={{ fontSize: 10, fontWeight: 600, color: C.gold, textTransform: "uppercase" }}>Ate Ayka Share</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: C.gold, fontFamily: "'JetBrains Mono', monospace" }}>{peso(grandAyka)}</div>
           </div>
-          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "14px 16px", textAlign: "center" }}>
-            <div style={{ fontSize: 10, fontWeight: 600, color: C.inkS, textTransform: "uppercase", letterSpacing: 0.5 }}>Total Due</div>
-            <div style={{ fontSize: 22, fontWeight: 700, color: C.navy, fontFamily: "'DM Serif Display', Georgia, serif" }}>{peso(grandTotal)}</div>
+          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "12px 14px", textAlign: "center" }}>
+            <div style={{ fontSize: 10, fontWeight: 600, color: C.navy, textTransform: "uppercase" }}>Mother Share</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: C.navy, fontFamily: "'JetBrains Mono', monospace" }}>{peso(grandMother)}</div>
           </div>
-          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "14px 16px", textAlign: "center" }}>
-            <div style={{ fontSize: 10, fontWeight: 600, color: C.inkS, textTransform: "uppercase", letterSpacing: 0.5 }}>Total Present</div>
-            <div style={{ fontSize: 22, fontWeight: 700, color: C.green }}>{totalPresent}</div>
+          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "12px 14px", textAlign: "center" }}>
+            <div style={{ fontSize: 10, fontWeight: 600, color: C.green, textTransform: "uppercase" }}>Total Paid</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: C.green, fontFamily: "'JetBrains Mono', monospace" }}>{peso(grandPaid)}</div>
           </div>
-          <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "14px 16px", textAlign: "center" }}>
-            <div style={{ fontSize: 10, fontWeight: 600, color: C.inkS, textTransform: "uppercase", letterSpacing: 0.5 }}>Total Absent</div>
-            <div style={{ fontSize: 22, fontWeight: 700, color: C.red }}>{totalAbsent}</div>
+          <div style={{ background: grandBal > 0 ? C.redBg : "#fff", border: `1px solid ${grandBal > 0 ? C.red : C.borderL}`, borderRadius: 10, padding: "12px 14px", textAlign: "center" }}>
+            <div style={{ fontSize: 10, fontWeight: 600, color: grandBal > 0 ? C.red : C.inkS, textTransform: "uppercase" }}>Remaining Balance</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: grandBal > 0 ? C.red : C.navy, fontFamily: "'JetBrains Mono', monospace" }}>{peso(grandBal)}</div>
           </div>
         </div>
 
-        <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 12, overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 640 }}>
-            <thead>
-              <tr style={{ background: C.navy, color: "#fff", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.6 }}>
-                <th style={{ padding: "12px 14px", textAlign: "left" }}>#</th>
-                <th style={{ padding: "12px 14px", textAlign: "left" }}>Business Name</th>
-                <th style={{ padding: "12px 14px", textAlign: "left" }}>Owner</th>
-                <th style={{ padding: "12px 14px", textAlign: "center" }}>Present</th>
-                <th style={{ padding: "12px 14px", textAlign: "center" }}>Absent</th>
-                <th style={{ padding: "12px 14px", textAlign: "right" }}>Kay Mother</th>
-                <th style={{ padding: "12px 14px", textAlign: "right" }}>Kay Ate Ayka</th>
-                <th style={{ padding: "12px 14px", textAlign: "right" }}>Total Due</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tenantTotals.map((t, i) => (
-                <tr key={t.id} className="table-row" style={{ background: i % 2 ? C.paperAlt : "#fff", borderTop: `1px solid ${C.borderL}` }}>
-                  <td style={{ padding: "10px 14px", fontSize: 13, color: C.inkS }}>{i + 1}</td>
-                  <td style={{ padding: "10px 14px" }}>
-                    <div style={{ fontWeight: 600, fontSize: 14 }}>{t.name}</div>
-                    {t.startDate && <div style={{ fontSize: 10, color: C.gold }}>Started: {t.startDate}</div>}
-                  </td>
-                  <td style={{ padding: "10px 14px", fontSize: 13 }}>{t.ownerName || "—"}</td>
-                  <td style={{ padding: "10px 14px", textAlign: "center" }}><span style={{ color: C.green, fontWeight: 600 }}>{t.presentC}</span></td>
-                  <td style={{ padding: "10px 14px", textAlign: "center" }}><span style={{ color: C.red, fontWeight: 600 }}>{t.absentC}</span></td>
-                  <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}>{peso(t.motherTotal || 0)}</td>
-                  <td style={{ padding: "10px 14px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.gold }}>{peso(t.aykaTotal || 0)}</td>
-                  <td style={{ padding: "10px 14px", textAlign: "right", fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", color: C.navy }}>{peso(t.totalDue)}</td>
+        <div style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 12, overflow: "hidden" }}>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 700 }}>
+              <thead>
+                <tr style={{ background: C.navy, color: "#fff", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.6 }}>
+                  <th style={{ padding: "12px 10px", textAlign: "left" }}>#</th>
+                  <th style={{ padding: "12px 10px", textAlign: "left" }}>Business Name</th>
+                  <th style={{ padding: "12px 10px", textAlign: "center" }}>Attendance</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Ate Ayka Share</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Mother Share</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Garbage</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Total Due</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Amount Paid</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Balance</th>
                 </tr>
-              ))}
-              {tenantTotals.length > 0 && (
-                <tr style={{ background: C.goldBg, fontWeight: 700 }}>
-                  <td colSpan={3} style={{ padding: "12px 14px", fontSize: 13, color: C.navy }}>GRAND TOTAL ({tenantTotals.length} tenants)</td>
-                  <td style={{ padding: "12px 14px", textAlign: "center", color: C.green }}>{totalPresent}</td>
-                  <td style={{ padding: "12px 14px", textAlign: "center", color: C.red }}>{totalAbsent}</td>
-                  <td style={{ padding: "12px 14px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.navy }}>{peso(grandMother)}</td>
-                  <td style={{ padding: "12px 14px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.gold }}>{peso(grandAyka)}</td>
-                  <td style={{ padding: "12px 14px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 14, color: C.navy }}>{peso(grandTotal)}</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {tenantTotals.map((t, i) => (
+                  <tr key={t.id} className="table-row" style={{ background: i % 2 ? C.paperAlt : "#fff", borderTop: `1px solid ${C.borderL}` }}>
+                    <td style={{ padding: "10px 10px", fontSize: 13, color: C.inkS }}>{i + 1}</td>
+                    <td style={{ padding: "10px 10px" }}>
+                      <div style={{ fontWeight: 600, fontSize: 14 }}>{t.name}</div>
+                      {t.ownerName && <div style={{ fontSize: 11, color: C.inkS }}>👤 {t.ownerName}</div>}
+                    </td>
+                    <td style={{ padding: "10px 10px", textAlign: "center" }}>
+                      <span style={{ color: C.green, fontWeight: 600, fontSize: 12 }}>✓{t.presentC}</span> <span style={{ color: C.red, fontWeight: 600, fontSize: 12 }}>✕{t.absentC}</span>
+                    </td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.gold, fontSize: 13 }}>{peso(t.aykaSum)}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.navy, fontSize: 13 }}>{peso(t.motherSum)}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.ink, fontSize: 13 }}>{peso(t.garbSum)}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: C.navy, fontSize: 13 }}>{peso(t.totalDue)}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.green, fontSize: 13, fontWeight: 600 }}>{peso(t.paidSum)}</td>
+                    <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: t.balSum > 0 ? C.red : C.inkS, fontSize: 13, fontWeight: t.balSum > 0 ? 700 : 400 }}>
+                      {t.balSum > 0 ? peso(t.balSum) : "—"}
+                    </td>
+                  </tr>
+                ))}
+                {tenantTotals.length > 0 && (
+                  <tr style={{ background: C.goldBg, fontWeight: 700 }}>
+                    <td colSpan={2} style={{ padding: "12px 10px", fontSize: 13, color: C.navy }}>GRAND TOTAL ({tenantTotals.length} tenants)</td>
+                    <td style={{ padding: "12px 10px", textAlign: "center" }}><span style={{ color: C.green }}>✓{totalPresent}</span> <span style={{ color: C.red }}>✕{totalAbsent}</span></td>
+                    <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.gold }}>{peso(grandAyka)}</td>
+                    <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.navy }}>{peso(grandMother)}</td>
+                    <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.ink }}>{peso(grandGarb)}</td>
+                    <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.navy, fontSize: 14 }}>{peso(grandTotal)}</td>
+                    <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.green, fontSize: 14 }}>{peso(grandPaid)}</td>
+                    <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: grandBal > 0 ? C.red : C.navy, fontSize: 14 }}>{peso(grandBal)}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
           {tenantTotals.length === 0 && loaded && (
             <div style={{ textAlign: "center", padding: 40, color: C.inkS }}>No tenants in this category.</div>
           )}
@@ -1971,8 +2123,6 @@ function CategoryReport({ category, onBack }) {
                             <th style={{ padding: '8px 12px', textAlign: 'left' }}>Date</th>
                             <th style={{ padding: '8px 12px', textAlign: 'center' }}>Status</th>
                             <th style={{ padding: '8px 12px', textAlign: 'right' }}>Rent</th>
-                            <th style={{ padding: '8px 12px', textAlign: 'right' }}>Mother</th>
-                            <th style={{ padding: '8px 12px', textAlign: 'right' }}>Ayka</th>
                             <th style={{ padding: '8px 12px', textAlign: 'right' }}>Garbage</th>
                             <th style={{ padding: '8px 12px', textAlign: 'right' }}>Total</th>
                             <th style={{ padding: '8px 12px', textAlign: 'center' }}>Signed</th>
@@ -1992,8 +2142,6 @@ function CategoryReport({ category, onBack }) {
                                   : <span style={{ color: C.inkS, fontSize: 12 }}>--</span>}
                                 </td>
                                 <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 12, color: dd.rent > 0 ? C.ink : C.border }}>{dd.rent > 0 ? peso(dd.rent) : '--'}</td>
-                                <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 12, color: dd.mother > 0 ? C.ink : C.border }}>{dd.mother > 0 ? peso(dd.mother) : '--'}</td>
-                                <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 12, color: dd.ayka > 0 ? C.gold : C.border }}>{dd.ayka > 0 ? peso(dd.ayka) : '--'}</td>
                                 <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 12, color: dd.garb > 0 ? C.ink : C.border }}>{dd.garb > 0 ? peso(dd.garb) : '--'}</td>
                                 <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 13, fontWeight: 700, color: dd.total > 0 ? C.navy : C.border }}>{dd.total > 0 ? peso(dd.total) : '--'}</td>
                                 <td style={{ padding: '7px 12px', textAlign: 'center' }}>
@@ -2232,8 +2380,12 @@ function UnpaidTenants({ category, onBack }) {
         let entries = {};
         try {
           const r = await window.storage.get(key);
-          entries = r && r.value ? JSON.parse(r.value) : {};
+          if (r && r.value) entries = JSON.parse(r.value);
         } catch {}
+        try {
+          const cloudData = await fetchKeyFromCloud(key);
+          if (cloudData) entries = mergeEntries(entries, cloudData);
+        } catch(e) {}
 
         const rangeDays = days.filter(d => d >= fromDay && d <= toDay);
         let unpaidDays = [];
@@ -2241,9 +2393,13 @@ function UnpaidTenants({ category, onBack }) {
 
         rangeDays.forEach(d => {
           const e = entries[dk(year, month, d)] || { status: null, signature: null };
-          if (!e.signature) {
+          const bal = rowBal(e, t);
+          if (!e.signature && e.status) {
             unpaidDays.push(d);
-            unpaidAmount += rowRent(e, t) + rowGarb(e);
+            unpaidAmount += rowTot(e, t);
+          } else if (e.signature && bal > 0) {
+            unpaidDays.push(d);
+            unpaidAmount += bal;
           }
         });
 
@@ -2394,7 +2550,7 @@ function UnpaidTenants({ category, onBack }) {
 }
 
 function App() {
-  const [screen, setScreen] = useState("loading");
+  const [screen, setScreen] = useState("lock");
   const [category, setCategory] = useState(null);
   const [tenants, setTenants] = useState([]);
   const [activeTenant, setActiveTenant] = useState(null);
@@ -2413,15 +2569,16 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      // Pull data from the cloud FIRST (max 6s so it still opens offline), then decide the screen
       try {
-        await Promise.race([
-          cloudRestore(),
-          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 6000))
-        ]);
+        await cloudRestore();
       } catch (e) {
         console.log("Initial cloud sync note:", e);
       }
+    })();
+  }, []);
+
+  useEffect(() => {
+    (async () => {
       try {
         if (sessionStorage.getItem("rl_unlocked") === "1") {
           setScreen("category");
@@ -2558,7 +2715,6 @@ function App() {
 
   return (
     <>
-      {screen === "loading" && <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: C.navy, color: "#fff", fontSize: 14, fontWeight: 600 }}>Loading data…</div>}
       {screen === "lock" && <LockScreen onUnlock={() => { try { sessionStorage.setItem("rl_unlocked", "1"); } catch {} setScreen("category"); setCategory(null); }} />}
 
       {screen === "category" && <CategoryScreen onSelect={handleCategorySelect} onLock={handleLock} onCloudBackup={handleCloudBackup} onCloudRestore={handleCloudRestore} cloudStatus={cloudStatus} />}
@@ -2607,34 +2763,6 @@ function App() {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-</script>
-<script>
-  // ── PWA Install Button (standalone; does not touch app code) ──
-  (function () {
-    var deferred = null;
-    var isStandalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
-    if (isStandalone) return;
-    var isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) && !window.MSStream;
-    var btn = document.createElement("button");
-    btn.type = "button";
-    btn.textContent = "\u2B07 Install App";
-    btn.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:99999;display:none;padding:10px 16px;border:1px solid #D4A23A;border-radius:999px;background:#1B2A4A;color:#fff;font:600 13px Inter,system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.3);cursor:pointer;";
-    function add() { document.body.appendChild(btn); }
-    if (document.body) add(); else document.addEventListener("DOMContentLoaded", add);
-    window.addEventListener("beforeinstallprompt", function (e) {
-      e.preventDefault(); deferred = e; btn.style.display = "block";
-    });
-    window.addEventListener("appinstalled", function () { btn.style.display = "none"; deferred = null; });
-    btn.addEventListener("click", function () {
-      if (deferred) {
-        deferred.prompt();
-        deferred.userChoice.then(function () { deferred = null; btn.style.display = "none"; });
-      } else if (isIOS) {
-        alert("To install: tap the Share button, then 'Add to Home Screen'.");
-      }
-    });
-    if (isIOS) btn.style.display = "block";
-  })();
 </script>
 </body>
 </html>
