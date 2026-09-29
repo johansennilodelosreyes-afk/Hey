@@ -123,6 +123,17 @@
       return { key: k, deleted: true };
     }
   };
+  // ── PWA Install Button support ──
+  window.deferredInstallPrompt = null;
+  window.addEventListener("beforeinstallprompt", function (e) {
+    e.preventDefault();
+    window.deferredInstallPrompt = e;
+    window.dispatchEvent(new Event("pwa-install-available"));
+  });
+  window.addEventListener("appinstalled", function () {
+    window.deferredInstallPrompt = null;
+    window.dispatchEvent(new Event("pwa-installed"));
+  });
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", function () {
       navigator.serviceWorker.register("./sw.js").catch(function () {});
@@ -1638,6 +1649,22 @@ function CategoryScreen({ onSelect, onLock, onCloudBackup, onCloudRestore, cloud
   const [confirmingRestore, setConfirmingRestore] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [showRestored, setShowRestored] = useState(false);
+  const [isInstalled, setIsInstalled] = useState(() => window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true);
+  useEffect(() => {
+    const onInstalled = () => setIsInstalled(true);
+    window.addEventListener("pwa-installed", onInstalled);
+    return () => window.removeEventListener("pwa-installed", onInstalled);
+  }, []);
+  const handleInstall = async () => {
+    const promptEvt = window.deferredInstallPrompt;
+    if (promptEvt) {
+      promptEvt.prompt();
+      try { await promptEvt.userChoice; } catch (e) {}
+      window.deferredInstallPrompt = null;
+    } else {
+      alert("To install: tap your browser menu (⋮ or Share) and choose 'Install app' or 'Add to Home Screen'.");
+    }
+  };
   return (
     <div style={{ minHeight: "100vh", background: C.paper, display: "flex", alignItems: "center", justifyContent: "center", padding: "40px 20px" }}>
       <div style={{ width: 440, maxWidth: "100%" }}>
@@ -1664,6 +1691,7 @@ function CategoryScreen({ onSelect, onLock, onCloudBackup, onCloudRestore, cloud
           <button onClick={() => setConfirmingRestore(true)} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.gold}`, borderRadius: 8, fontSize: 12, color: C.gold, cursor: "pointer", fontWeight: 600 }}>♻️ Restore</button>
           <button onClick={() => setShowLog(true)} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.gold}`, borderRadius: 8, fontSize: 12, color: C.gold, cursor: "pointer", fontWeight: 600 }}>📜 History</button>
           <button onClick={onLock} style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 12, color: C.inkS, cursor: "pointer" }}>🔒 Lock</button>
+          {!isInstalled && <button onClick={handleInstall} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.navy}`, borderRadius: 8, fontSize: 12, color: C.navy, cursor: "pointer", fontWeight: 600 }}>📲 Install App</button>}
         </div>
         {cloudStatus && <div style={{ marginTop: 10, textAlign: "center", fontSize: 11, color: C.green, fontWeight: 500 }}>{cloudStatus}</div>}
       </div>
@@ -2589,7 +2617,22 @@ function App() {
   }, []);
 
   const loadTenants = async (cat) => {
-    try { const r = await window.storage.get(`tenants:${cat}`); return r && r.value ? JSON.parse(r.value) : []; } catch { return []; }
+    const key = `tenants:${cat}`;
+    let list = [];
+    try {
+      const r = await window.storage.get(key);
+      if (r && r.value) list = JSON.parse(r.value);
+    } catch {}
+    if (!list || list.length === 0) {
+      try {
+        const cloudList = await fetchKeyFromCloud(key);
+        if (cloudList && Array.isArray(cloudList) && cloudList.length > 0) {
+          list = cloudList;
+          await window.storage.set(key, JSON.stringify(list)).catch(() => {});
+        }
+      } catch(e) {}
+    }
+    return list || [];
   };
   const saveSession = async (cat, tid) => { try { await window.storage.set("session", JSON.stringify({ category: cat, tenantId: tid || null })); } catch {} };
   const saveTenants = async (cat, list) => {
