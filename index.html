@@ -152,7 +152,6 @@
   }
   window.logActivity = logActivity;
 
-  // Granular path update: writes to /records/{key} so Device A & Device B never overwrite each other
   async function syncKeyToCloud(key, value) {
     try {
       var safeKey = key.replace(/\./g, "_");
@@ -168,7 +167,6 @@
     }
   }
 
-  // Fetch a single record directly from Firebase Cloud
   async function fetchKeyFromCloud(key) {
     try {
       var safeKey = key.replace(/\./g, "_");
@@ -184,7 +182,6 @@
     }
   }
 
-  // Smart Merge function: merges Day entries from local and cloud so no device loses signatures or rent split details
   function mergeEntries(localEntries, remoteEntries) {
     if (!remoteEntries) return localEntries || {};
     if (!localEntries) return remoteEntries || {};
@@ -212,7 +209,6 @@
     return merged;
   }
 
-  // Offline Outbox Queue management
   function addToOutbox(key, val) {
     try {
       var raw = localStorage.getItem("rl:outbox_queue");
@@ -247,7 +243,6 @@
   window.addEventListener("online", flushOutbox);
   setInterval(flushOutbox, 10000);
 
-  // Backup all local keys up to Firebase
   async function cloudBackup() {
     await flushOutbox();
     var data = {};
@@ -271,7 +266,6 @@
     return true;
   }
 
-  // Pull all records from Cloud and merge into local device storage
   async function cloudRestore() {
     var res = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + ".json");
     if (!res.ok) throw new Error("Firebase read failed: " + res.status);
@@ -304,7 +298,6 @@
     return val.lastBackup || new Date().toISOString();
   }
 
-  // Auto-backup debouncer
   function autoBackupToCloud(specificKey, specificVal) {
     if (specificKey && specificVal !== undefined) {
       addToOutbox(specificKey, specificVal);
@@ -327,7 +320,6 @@
     }, 1500);
   }
 
-  // Signature canvas compressor: crops white margins, resizes, and compresses base64 string
   function compressSignatureCanvas(canvas) {
     try {
       var ctx = canvas.getContext('2d');
@@ -417,8 +409,8 @@ function doBackup() {
 }
 
 function rowRent(e, s) { if (e.rentAmount != null) return Number(e.rentAmount); if (e.status === 'present') return Number(s.presentFee) || 0; if (e.status === 'absent') return Number(s.absentFee) || 0; return 0; }
-function rowAyka(e, s) { if (e.aykaShare != null) return Number(e.aykaShare); if (e.status === 'present') return s.presentAykaShare != null ? Number(s.presentAykaShare) : Math.round((Number(s.presentFee) || 0) * 0.7); if (e.status === 'absent') return s.absentAykaShare != null ? Number(s.absentAykaShare) : Math.round((Number(s.absentFee) || 0) * 0.7); return 0; }
-function rowMother(e, s) { if (e.motherShare != null) return Number(e.motherShare); if (e.status === 'present') return s.presentMotherShare != null ? Number(s.presentMotherShare) : ((Number(s.presentFee) || 0) - rowAyka(e, s)); if (e.status === 'absent') return s.absentMotherShare != null ? Number(s.absentMotherShare) : ((Number(s.absentFee) || 0) - rowAyka(e, s)); return 0; }
+function rowAyka(e, s) { if (e.aykaShare != null) return Number(e.aykaShare) + rowGarb(e); if (e.status === 'present') return (s.presentAykaShare != null ? Number(s.presentAykaShare) : Math.round((Number(s.presentFee) || 0) * 0.7)) + GARBAGE; if (e.status === 'absent') return s.absentAykaShare != null ? Number(s.absentAykaShare) : Math.round((Number(s.absentFee) || 0) * 0.7); return 0; }
+function rowMother(e, s) { if (e.motherShare != null) return Number(e.motherShare); if (e.status === 'present') return s.presentMotherShare != null ? Number(s.presentMotherShare) : ((Number(s.presentFee) || 0) - (s.presentAykaShare != null ? Number(s.presentAykaShare) : Math.round((Number(s.presentFee) || 0) * 0.7))); if (e.status === 'absent') return s.absentMotherShare != null ? Number(s.absentMotherShare) : ((Number(s.absentFee) || 0) - (s.absentAykaShare != null ? Number(s.absentAykaShare) : Math.round((Number(s.absentFee) || 0) * 0.7))); return 0; }
 function rowGarb(e) { return e.status === "present" ? GARBAGE : 0; }
 function rowTot(e, s) { return rowRent(e, s) + rowGarb(e); }
 function rowPaid(e, s) { if (!e.status) return 0; if (e.amountPaid != null) return Number(e.amountPaid); if (e.signature) return rowTot(e, s); return 0; }
@@ -674,22 +666,26 @@ function TenantModal({ tenant, category, onSave, onClose }) {
                 <input type="number" min="0" value={af} onChange={(e) => handleAfChange(e.target.value)} placeholder="e.g. 200"
                   style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13, fontWeight: 600 }} />
               </div>
+              <div>
+                <label style={{ fontSize: 10, fontWeight: 600, color: C.gold, display: "block", marginBottom: 3 }}>Ate Ayka Share</label>
+                <input type="number" min="0" value={aaf} onChange={(e) => { setAaf(e.target.value); setErr(""); }} placeholder="e.g. 60"
+                  style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
               </div>
               <div>
                 <label style={{ fontSize: 10, fontWeight: 600, color: C.navy, display: "block", marginBottom: 3 }}>Mother Share</label>
                 <input type="number" min="0" value={amf} onChange={(e) => { setAmf(e.target.value); setErr(""); }} placeholder="e.g. 140"
                   style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
               </div>
-              <div>
-                <label style={{ fontSize: 10, fontWeight: 600, color: C.gold, display: "block", marginBottom: 3 }}>Ate Ayka Share</label>
-                <input type="number" min="0" value={aaf} onChange={(e) => { setAaf(e.target.value); setErr(""); }} placeholder="e.g. 60"
-                  style={{ width: "100%", padding: "8px 10px", border: `1px solid ${C.border}`, borderRadius: 6, fontSize: 13 }} />
-              </div>
             </div>
+            {aDiff && af !== "" && (
+              <div style={{ fontSize: 11, color: C.red, marginTop: 6, fontWeight: 500 }}>
+                ⚠️ Ate Ayka ({aaf || 0}) + Mother ({amf || 0}) = {aSum}, di tugma sa Total Rent ({aTot}).
+              </div>
+            )}
           </div>
 
           <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: C.inkS, marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.8 }}>Owner Name</label>
-          <input value={ownerName} onChange={(e) => setOwnerName(e.target.value)} placeholder="e.g. Juan Dela Cruz"
+          <input value={ownerName} onChange={(e) => setName(e.target.value)} placeholder="e.g. Juan Dela Cruz"
             style={{ width: "100%", padding: "10px 12px", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 13, marginBottom: 12 }} />
           
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
@@ -945,7 +941,10 @@ function DayDetailsModal({ day, dateStr, tenant, entry, onSave, onClose }) {
           </div>
 
           <div style={{ padding: 12, border: `1px solid ${C.borderL}`, borderRadius: 10, background: C.paper, marginBottom: 14 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, color: C.navy, marginBottom: 8, textTransform: "uppercase" }}>Rent Payment Breakdown (₱)</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: C.navy, textTransform: "uppercase" }}>Rent Payment Breakdown (₱)</div>
+              <button type="button" onClick={() => handleStatusSelect(status || "present")} style={{ fontSize: 10, color: C.gold, background: "none", border: "none", cursor: "pointer", textDecoration: "underline", fontWeight: 600 }}>🔄 Reset to Tenant Rates</button>
+            </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
               <div>
                 <label style={{ fontSize: 10, fontWeight: 600, color: C.inkS, display: "block", marginBottom: 3 }}>Total Rent</label>
@@ -1031,7 +1030,6 @@ function Ledger({ tenant, onBack }) {
     setEntries(localData);
     setLoaded(true);
 
-    // Fetch latest cloud record and merge so multi-device updates appear immediately
     fetchKeyFromCloud(storeKey).then((remoteData) => {
       if (remoteData) {
         const merged = mergeEntries(localData, remoteData);
@@ -1066,7 +1064,6 @@ function Ledger({ tenant, onBack }) {
 
   useEffect(() => { loadMonth(); }, [loadMonth]);
 
-  // Periodic poll every 8 seconds when on screen for real-time cross-device sync
   useEffect(() => {
     const pollTimer = setInterval(async () => {
       const remoteData = await fetchKeyFromCloud(storeKey);
@@ -1081,18 +1078,22 @@ function Ledger({ tenant, onBack }) {
     return () => clearInterval(pollTimer);
   }, [storeKey]);
 
-  const flash = (msg) => { setSaveNote(msg || "Saved ✓"); clearTimeout(saveTimer.current); saveTimer.current = setTimeout(() => setSaveNote(""), 1200); };
+  const flash = (msg) => { setSaveNote(msg || "Saved ✓"); clearTimeout(saveTimer.current); saveTimer.current = setTimeout(() => setSaveNote(""), 1400); };
   
   const persist = async (next) => {
     setEntries(next);
     const jsonVal = JSON.stringify(next);
     try {
-      await window.storage.set(storeKey, jsonVal);
-      flash();
+      const res = await window.storage.set(storeKey, jsonVal);
+      if (res && res.warning) {
+        flash("Synced directly to Cloud ✓");
+      } else {
+        flash("Saved ✓");
+      }
       autoBackupToCloud(storeKey, jsonVal);
     } catch (err) {
-      console.error("Storage error:", err);
-      alert("Storage warning: Could not save to local device storage. Syncing directly to cloud database instead.");
+      console.warn("Storage error fallback:", err);
+      flash("Synced directly to Cloud ✓");
       autoBackupToCloud(storeKey, jsonVal);
     }
   };
@@ -1105,15 +1106,14 @@ function Ledger({ tenant, onBack }) {
     const k = dk(year, month, d);
     const existing = getEntry(d);
     if ("status" in patch && patch.status) {
-      if (patch.status !== existing.status || existing.rentAmount == null) {
-        patch.rentAmount = patch.status === "present" ? tenant.presentFee : tenant.absentFee;
-        patch.motherShare = patch.status === "present"
-          ? (tenant.presentMotherShare != null ? tenant.presentMotherShare : tenant.presentFee)
-          : (tenant.absentMotherShare != null ? tenant.absentMotherShare : tenant.absentFee);
-        patch.aykaShare = patch.status === "present"
-          ? (tenant.presentAykaShare != null ? tenant.presentAykaShare : 0)
-          : (tenant.absentAykaShare != null ? tenant.absentAykaShare : 0);
-      }
+      const p = patch.status === "present";
+      patch.rentAmount = p ? tenant.presentFee : tenant.absentFee;
+      patch.aykaShare = p
+        ? (tenant.presentAykaShare != null ? tenant.presentAykaShare : Math.round((Number(tenant.presentFee)||0)*0.7))
+        : (tenant.absentAykaShare != null ? tenant.absentAykaShare : Math.round((Number(tenant.absentFee)||0)*0.7));
+      patch.motherShare = p
+        ? (tenant.presentMotherShare != null ? tenant.presentMotherShare : ((Number(tenant.presentFee)||0) - patch.aykaShare))
+        : (tenant.absentMotherShare != null ? tenant.absentMotherShare : ((Number(tenant.absentFee)||0) - patch.aykaShare));
     }
     if ("status" in patch && !patch.status) {
       patch.rentAmount = undefined;
@@ -1142,19 +1142,23 @@ function Ledger({ tenant, onBack }) {
   const days = Array.from({ length: numDays }, (_, i) => i + 1);
   
   let totalDue = 0, presentC = 0, absentC = 0, signedC = 0;
-  let totalRentSum = 0, totalMotherSum = 0, totalAykaSum = 0, totalGarbSum = 0;
+  let totalRentSum = 0, totalMotherSum = 0, totalAykaSum = 0, totalGarbSum = 0, totalPaidSum = 0, totalBalSum = 0;
   days.forEach((d) => {
     const e = getEntry(d);
     const rent = rowRent(e, tenant);
     const mother = rowMother(e, tenant);
     const ayka = rowAyka(e, tenant);
     const garb = rowGarb(e);
+    const pd = rowPaid(e, tenant);
+    const bl = rowBal(e, tenant);
     if (e.signature) { totalDue += rowTot(e, tenant); }
     if (e.status === "present" || e.status === "absent") {
       if (e.status === "present") presentC++; else absentC++;
       totalRentSum += rent;
       totalMotherSum += mother;
       totalAykaSum += ayka;
+      totalPaidSum += pd;
+      totalBalSum += bl;
     }
     totalGarbSum += garb;
     if (e.signature) signedC++;
@@ -1218,7 +1222,7 @@ function Ledger({ tenant, onBack }) {
     const catLabel = categoryLabel(tenant.category);
     lbl("  |  TYPE:", catLabel, ml + 70, y);
     y += 5;
-    lbl("PRESENT FEE:", `${Number(tenant.presentFee).toFixed(2)} (Mother: ${Number(tenant.presentMotherShare != null ? tenant.presentMotherShare : tenant.presentFee).toFixed(2)}, Ayka: ${Number(tenant.presentAykaShare || 0).toFixed(2)})`, ml, y);
+    lbl("PRESENT FEE:", `${Number(tenant.presentFee).toFixed(2)} (Ayka: ${Number(tenant.presentAykaShare != null ? tenant.presentAykaShare : Math.round(tenant.presentFee*0.7)).toFixed(2)}, Mother: ${Number(tenant.presentMotherShare != null ? tenant.presentMotherShare : (tenant.presentFee - Math.round(tenant.presentFee*0.7))).toFixed(2)})`, ml, y);
     y += 8;
 
     const pdfDays = useRange ? days.filter((d) => d >= rangeStart && d <= rangeEnd) : days;
@@ -1255,8 +1259,8 @@ function Ledger({ tenant, onBack }) {
         wd,
         e.status ? e.status.toUpperCase() : "—",
         rent > 0 ? Number(rent).toFixed(2) : "",
-        mother > 0 ? Number(mother).toFixed(2) : "",
         ayka > 0 ? Number(ayka).toFixed(2) : "",
+        mother > 0 ? Number(mother).toFixed(2) : "",
         garb > 0 ? Number(garb).toFixed(2) : "",
         tot > 0 ? Number(tot).toFixed(2) : "",
         rmk,
@@ -1264,14 +1268,13 @@ function Ledger({ tenant, onBack }) {
       ];
     });
 
-    // Add Totals row to PDF
     rows.push([
       "TOTALS",
       "",
       `${presentC}P / ${absentC}A`,
       Number(pdfRentTotal).toFixed(2),
-      Number(pdfMotherTotal).toFixed(2),
       Number(pdfAykaTotal).toFixed(2),
+      Number(pdfMotherTotal).toFixed(2),
       Number(pdfGarbTotal).toFixed(2),
       Number(pdfGrandTotal).toFixed(2),
       "",
@@ -1280,7 +1283,7 @@ function Ledger({ tenant, onBack }) {
 
     doc.autoTable({
       startY: y, margin: { left: ml, right: mr },
-      head: [["DATE", "DAY", "STATUS", "RENT", "MOTHER", "AYKA", "GARBAGE", "TOTAL", "REMARKS", "SIGNATURE"]],
+      head: [["DATE", "DAY", "STATUS", "RENT", "AYKA", "MOTHER", "TOTAL", "REMARKS", "SIGNATURE"]],
       body: rows,
       styles: { fontSize: 7.5, cellPadding: { top: 2.5, bottom: 2.5, left: 3, right: 3 }, textColor: [50, 50, 50], lineColor: [215, 210, 200], lineWidth: 0.2, font: "helvetica" },
       headStyles: { fillColor: [27, 42, 74], textColor: [255, 255, 255], fontStyle: "bold", fontSize: 7 },
@@ -1292,13 +1295,12 @@ function Ledger({ tenant, onBack }) {
         3: { halign: "right", cellWidth: 18 },
         4: { halign: "right", cellWidth: 18 },
         5: { halign: "right", cellWidth: 18 },
-        6: { halign: "right", cellWidth: 16 },
-        7: { halign: "right", cellWidth: 20, fontStyle: "bold" },
-        8: { cellWidth: 26 },
-        9: { cellWidth: 21, halign: "center" }
+        6: { halign: "right", cellWidth: 20, fontStyle: "bold" },
+        7: { cellWidth: 26 },
+        8: { cellWidth: 21, halign: "center" }
       },
       didDrawCell: function(data) {
-        if (data.column.index === 9 && data.section === 'body' && data.row.index < pdfDays.length) {
+        if (data.column.index === 8 && data.section === 'body' && data.row.index < pdfDays.length) {
           const dayNum = pdfDays[data.row.index];
           if (dayNum && sigImages[dayNum]) {
             try {
@@ -1336,15 +1338,13 @@ function Ledger({ tenant, onBack }) {
     doc.setTextColor(100, 95, 85);
     doc.setFont("helvetica", "bold");
     doc.text("TOTAL RENT:", bx, by);
-    doc.text("MOTHER SHARE:", bx + 42, by);
-    doc.text("ATE AYKA SHARE:", bx + 84, by);
-    doc.text("GARBAGE:", bx + 126, by);
+    doc.text("ATE AYKA SHARE:", bx + 50, by);
+    doc.text("MOTHER SHARE:", bx + 100, by);
     doc.setFont("helvetica", "normal");
     doc.setTextColor(40, 40, 40);
     doc.text(Number(pdfRentTotal).toFixed(2), bx, by + 4);
-    doc.text(Number(pdfMotherTotal).toFixed(2), bx + 42, by + 4);
-    doc.text(Number(pdfAykaTotal).toFixed(2), bx + 84, by + 4);
-    doc.text(Number(pdfGarbTotal).toFixed(2), bx + 126, by + 4);
+    doc.text(Number(pdfAykaTotal).toFixed(2), bx + 50, by + 4);
+    doc.text(Number(pdfMotherTotal).toFixed(2), bx + 100, by + 4);
 
     doc.setFont("helvetica", "bold");
     doc.setFontSize(8.5);
@@ -1380,7 +1380,7 @@ function Ledger({ tenant, onBack }) {
           <button onClick={onBack} style={{ background: "rgba(255,255,255,0.12)", border: "1px solid rgba(255,255,255,0.18)", borderRadius: 8, padding: "6px 12px", color: "#fff", fontSize: 13, cursor: "pointer", marginBottom: 12 }}>← Back to Tenants</button>
           <div style={{ fontSize: 22, fontWeight: 700 }}>{tenant.name}</div>
           <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-            {categoryLabel(tenant.category)} · Present {peso(tenant.presentFee)} (Mother {peso(tenant.presentMotherShare != null ? tenant.presentMotherShare : tenant.presentFee)} / Ayka {peso(tenant.presentAykaShare || 0)}) · Garbage {peso(GARBAGE)}
+            {categoryLabel(tenant.category)} · Present {peso(tenant.presentFee)} (Ayka {peso(tenant.presentAykaShare != null ? tenant.presentAykaShare : Math.round(tenant.presentFee*0.7))} / Mother {peso(tenant.presentMotherShare != null ? tenant.presentMotherShare : (tenant.presentFee - Math.round(tenant.presentFee*0.7)))}) · Garbage {peso(GARBAGE)}
           </div>
         </div>
       </div>
@@ -1393,16 +1393,12 @@ function Ledger({ tenant, onBack }) {
             <div style={{ fontSize: 18, fontWeight: 700, color: C.navy, marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{peso(totalRentSum)}</div>
           </div>
           <div className="fade-in" style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "12px 14px", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: C.navy, textTransform: "uppercase", letterSpacing: 0.5 }}>Sinusulit kay Mother</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: C.navy, marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{peso(totalMotherSum)}</div>
-          </div>
-          <div className="fade-in" style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "12px 14px", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: C.gold, textTransform: "uppercase", letterSpacing: 0.5 }}>Kay Ate Ayka (Natitira)</div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.gold, textTransform: "uppercase", letterSpacing: 0.5 }}>Kay Ate Ayka Share</div>
             <div style={{ fontSize: 18, fontWeight: 700, color: C.gold, marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{peso(totalAykaSum)}</div>
           </div>
           <div className="fade-in" style={{ background: "#fff", border: `1px solid ${C.borderL}`, borderRadius: 10, padding: "12px 14px", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: C.inkS, textTransform: "uppercase", letterSpacing: 0.5 }}>Garbage Fee</div>
-            <div style={{ fontSize: 18, fontWeight: 700, color: C.ink, marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{peso(totalGarbSum)}</div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.navy, textTransform: "uppercase", letterSpacing: 0.5 }}>Sinusulit kay Mother</div>
+            <div style={{ fontSize: 18, fontWeight: 700, color: C.navy, marginTop: 4, fontFamily: "'JetBrains Mono', monospace" }}>{peso(totalMotherSum)}</div>
           </div>
           <div className="fade-in" style={{ background: `linear-gradient(135deg, ${C.navy} 0%, ${C.navyL} 100%)`, color: "#fff", borderRadius: 10, padding: "12px 14px", boxShadow: "0 2px 8px rgba(27,42,74,0.2)" }}>
             <div style={{ fontSize: 10, fontWeight: 700, opacity: 0.8, textTransform: "uppercase", letterSpacing: 0.5 }}>Grand Total</div>
@@ -1443,16 +1439,17 @@ function Ledger({ tenant, onBack }) {
 
         <div style={{ background: '#fff', border: `1px solid ${C.borderL}`, borderRadius: 12, overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.05)' }}>
           <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 780 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 800 }}>
               <thead>
                 <tr style={{ background: C.navy, color: "#fff", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.6 }}>
                   <th style={{ padding: "12px 10px", textAlign: "left" }}>Date</th>
                   <th style={{ padding: "12px 10px", textAlign: "center" }}>Status</th>
                   <th style={{ padding: "12px 10px", textAlign: "right" }}>Total Rent</th>
-                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Sinusulit kay Mother</th>
                   <th style={{ padding: "12px 10px", textAlign: "right" }}>Kay Ate Ayka</th>
-                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Garbage</th>
-                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Total</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Sinusulit kay Mother</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Total Due</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Amount Paid</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Balance</th>
                   <th style={{ padding: "12px 10px", textAlign: "left" }}>Remarks</th>
                   <th style={{ padding: "12px 10px", textAlign: "center" }}>Signature</th>
                 </tr>
@@ -1466,7 +1463,8 @@ function Ledger({ tenant, onBack }) {
                   const isToday = dObj.toDateString() === today.toDateString();
                   const isWknd = dObj.getDay() === 0 || dObj.getDay() === 6;
                   const isInRange = useRange && day >= rangeStart && day <= rangeEnd;
-                  const rent = rowRent(e, tenant), mother = rowMother(e, tenant), ayka = rowAyka(e, tenant), garb = rowGarb(e), tot = rowTot(e, tenant);
+                  const rent = rowRent(e, tenant), mother = rowMother(e, tenant), ayka = rowAyka(e, tenant), tot = rowTot(e, tenant);
+                  const pd = rowPaid(e, tenant), bl = rowBal(e, tenant);
                   const hasPaidDiffDate = e.datePaid && e.datePaid !== dateStr;
                   return (
                     <tr key={day} className="table-row" style={{ background: isInRange ? 'rgba(197,150,26,0.08)' : isToday ? 'rgba(197,150,26,0.05)' : idx % 2 ? '#fff' : C.paperAlt, borderTop: `1px solid ${C.borderL}`, borderLeft: isInRange ? '3px solid #C5961A' : '3px solid transparent' }}>
@@ -1487,10 +1485,11 @@ function Ledger({ tenant, onBack }) {
                         </div>
                       </td>
                       <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: rent > 0 ? C.ink : C.border }}>{e.status ? peso(rent) : "—"}</td>
-                      <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: mother > 0 ? C.navy : C.border }}>{e.status ? peso(mother) : "—"}</td>
                       <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: ayka > 0 ? C.gold : C.border }}>{e.status ? peso(ayka) : "—"}</td>
-                      <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: garb > 0 ? C.ink : C.border }}>{peso(garb)}</td>
+                      <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: mother > 0 ? C.navy : C.border }}>{e.status ? peso(mother) : "—"}</td>
                       <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: tot > 0 ? C.navy : C.border }}>{peso(tot)}</td>
+                      <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.green, fontWeight: 600 }}>{e.status ? peso(pd) : "—"}</td>
+                      <td style={{ padding: "8px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: bl > 0 ? C.red : C.inkS, fontWeight: bl > 0 ? 700 : 400 }}>{bl > 0 ? peso(bl) : "—"}</td>
                       <td style={{ padding: "8px 10px", fontSize: 12, color: C.ink }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                           <span>{e.remarks || "—"}</span>
@@ -1513,7 +1512,7 @@ function Ledger({ tenant, onBack }) {
                     </tr>
                   );
                 })}
-                {!loaded && <tr><td colSpan={9} style={{ padding: 32, textAlign: "center", color: C.inkS }}>Loading...</td></tr>}
+                {!loaded && <tr><td colSpan={10} style={{ padding: 32, textAlign: "center", color: C.inkS }}>Loading...</td></tr>}
               </tbody>
               <tfoot style={{ background: C.goldBg, fontWeight: 700, borderTop: `2px solid ${C.gold}` }}>
                 <tr>
@@ -1522,10 +1521,11 @@ function Ledger({ tenant, onBack }) {
                     <span style={{ color: C.green }}>✓{presentC}</span> <span style={{ color: C.navy }}>✕{absentC}</span>
                   </td>
                   <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.navy }}>{peso(totalRentSum)}</td>
-                  <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.navy }}>{peso(totalMotherSum)}</td>
                   <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.gold }}>{peso(totalAykaSum)}</td>
-                  <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.ink }}>{peso(totalGarbSum)}</td>
-                  <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 14, color: C.navy }}>{peso(totalRentSum + totalGarbSum)}</td>
+                  <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.navy }}>{peso(totalMotherSum)}</td>
+                  <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 14, color: C.navy }}>{peso(totalDue)}</td>
+                  <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.green }}>{peso(totalPaidSum)}</td>
+                  <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: totalBalSum > 0 ? C.red : C.navy }}>{peso(totalBalSum)}</td>
                   <td style={{ padding: "12px 10px", fontSize: 11, color: C.inkS }}>—</td>
                   <td style={{ padding: "12px 10px", textAlign: "center", fontSize: 11, color: C.green }}>{signedC}/{numDays} signed</td>
                 </tr>
@@ -1544,9 +1544,8 @@ function Ledger({ tenant, onBack }) {
             </div>
             <div style={{ display: "flex", gap: 14, fontSize: 11, color: C.inkS, flexWrap: "wrap" }}>
               <span>Total Rent: {peso(totalRentSum)}</span>
-              <span>Mother Share: {peso(totalMotherSum)}</span>
               <span>Ate Ayka Share: {peso(totalAykaSum)}</span>
-              <span>Garbage: {peso(totalGarbSum)}</span>
+              <span>Mother Share: {peso(totalMotherSum)}</span>
             </div>
           </div>
           <div style={{ textAlign: "right" }}>
@@ -1578,8 +1577,8 @@ function Ledger({ tenant, onBack }) {
                   <span style={{ color: C.green }}>✓ {rangePresentC} present</span>
                   <span style={{ color: C.navy }}>✕ {rangeAbsentC} absent</span>
                   <span>Rent: {peso(rangeRentSum)}</span>
-                  <span>Mother: {peso(rangeMotherSum)}</span>
                   <span>Ayka: {peso(rangeAykaSum)}</span>
+                  <span>Mother: {peso(rangeMotherSum)}</span>
                   <span>Garbage: {peso(rangeGarbSum)}</span>
                 </div>
               </div>
@@ -1932,7 +1931,6 @@ function CategoryReport({ category, onBack }) {
       t.absentC,
       pesoPdf(t.aykaSum),
       pesoPdf(t.motherSum),
-      pesoPdf(t.garbSum),
       pesoPdf(t.totalDue),
       pesoPdf(t.paidSum),
       pesoPdf(t.balSum)
@@ -1946,7 +1944,6 @@ function CategoryReport({ category, onBack }) {
       totalAbsent,
       pesoPdf(grandAyka),
       pesoPdf(grandMother),
-      pesoPdf(grandGarb),
       pesoPdf(grandTotal),
       pesoPdf(grandPaid),
       pesoPdf(grandBal)
@@ -1954,12 +1951,12 @@ function CategoryReport({ category, onBack }) {
 
     doc.autoTable({
       startY: y, margin: { left: ml, right: mr },
-      head: [["#", "Business Name", "Owner", "Present", "Absent", "Ayka Share", "Mother Share", "Garbage", "Total Due", "Paid", "Balance"]],
+      head: [["#", "Business Name", "Owner", "Present", "Absent", "Ayka Share", "Mother Share", "Total Due", "Paid", "Balance"]],
       body: rows,
       styles: { fontSize: 8.5, cellPadding: 3 },
       headStyles: { fillColor: [27, 42, 74], textColor: [255, 255, 255], fontStyle: "bold" },
       alternateRowStyles: { fillColor: [248, 246, 240] },
-      columnStyles: { 0: { cellWidth: 10 }, 5: { halign: "right" }, 6: { halign: "right" }, 7: { halign: "right" }, 8: { halign: "right", fontStyle: "bold" }, 9: { halign: "right" }, 10: { halign: "right", fontStyle: "bold" } }
+      columnStyles: { 0: { cellWidth: 10 }, 5: { halign: "right" }, 6: { halign: "right" }, 7: { halign: "right", fontStyle: "bold" }, 8: { halign: "right" }, 9: { halign: "right", fontStyle: "bold" } }
     });
 
     doc.setFontSize(7);
@@ -2049,7 +2046,6 @@ function CategoryReport({ category, onBack }) {
                   <th style={{ padding: "12px 10px", textAlign: "center" }}>Attendance</th>
                   <th style={{ padding: "12px 10px", textAlign: "right" }}>Ate Ayka Share</th>
                   <th style={{ padding: "12px 10px", textAlign: "right" }}>Mother Share</th>
-                  <th style={{ padding: "12px 10px", textAlign: "right" }}>Garbage</th>
                   <th style={{ padding: "12px 10px", textAlign: "right" }}>Total Due</th>
                   <th style={{ padding: "12px 10px", textAlign: "right" }}>Amount Paid</th>
                   <th style={{ padding: "12px 10px", textAlign: "right" }}>Balance</th>
@@ -2068,7 +2064,6 @@ function CategoryReport({ category, onBack }) {
                     </td>
                     <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.gold, fontSize: 13 }}>{peso(t.aykaSum)}</td>
                     <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.navy, fontSize: 13 }}>{peso(t.motherSum)}</td>
-                    <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.ink, fontSize: 13 }}>{peso(t.garbSum)}</td>
                     <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: C.navy, fontSize: 13 }}>{peso(t.totalDue)}</td>
                     <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.green, fontSize: 13, fontWeight: 600 }}>{peso(t.paidSum)}</td>
                     <td style={{ padding: "10px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: t.balSum > 0 ? C.red : C.inkS, fontSize: 13, fontWeight: t.balSum > 0 ? 700 : 400 }}>
@@ -2082,7 +2077,6 @@ function CategoryReport({ category, onBack }) {
                     <td style={{ padding: "12px 10px", textAlign: "center" }}><span style={{ color: C.green }}>✓{totalPresent}</span> <span style={{ color: C.red }}>✕{totalAbsent}</span></td>
                     <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.gold }}>{peso(grandAyka)}</td>
                     <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.navy }}>{peso(grandMother)}</td>
-                    <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.ink }}>{peso(grandGarb)}</td>
                     <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.navy, fontSize: 14 }}>{peso(grandTotal)}</td>
                     <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: C.green, fontSize: 14 }}>{peso(grandPaid)}</td>
                     <td style={{ padding: "12px 10px", textAlign: "right", fontFamily: "'JetBrains Mono', monospace", color: grandBal > 0 ? C.red : C.navy, fontSize: 14 }}>{peso(grandBal)}</td>
@@ -2123,7 +2117,6 @@ function CategoryReport({ category, onBack }) {
                             <th style={{ padding: '8px 12px', textAlign: 'left' }}>Date</th>
                             <th style={{ padding: '8px 12px', textAlign: 'center' }}>Status</th>
                             <th style={{ padding: '8px 12px', textAlign: 'right' }}>Rent</th>
-                            <th style={{ padding: '8px 12px', textAlign: 'right' }}>Garbage</th>
                             <th style={{ padding: '8px 12px', textAlign: 'right' }}>Total</th>
                             <th style={{ padding: '8px 12px', textAlign: 'center' }}>Signed</th>
                           </tr>
@@ -2142,7 +2135,6 @@ function CategoryReport({ category, onBack }) {
                                   : <span style={{ color: C.inkS, fontSize: 12 }}>--</span>}
                                 </td>
                                 <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 12, color: dd.rent > 0 ? C.ink : C.border }}>{dd.rent > 0 ? peso(dd.rent) : '--'}</td>
-                                <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 12, color: dd.garb > 0 ? C.ink : C.border }}>{dd.garb > 0 ? peso(dd.garb) : '--'}</td>
                                 <td style={{ padding: '7px 12px', textAlign: 'right', fontSize: 13, fontWeight: 700, color: dd.total > 0 ? C.navy : C.border }}>{dd.total > 0 ? peso(dd.total) : '--'}</td>
                                 <td style={{ padding: '7px 12px', textAlign: 'center' }}>
                                   {dd.signed ? <span style={{ color: C.green, fontSize: 11, fontWeight: 600 }}>Signed</span>
@@ -2620,7 +2612,7 @@ function App() {
 
   const PRICE_FIELDS = ['presentFee','absentFee','presentMotherShare','absentMotherShare','presentAykaShare','absentAykaShare'];
 
-  const freezeExistingEntries = async (oldTenant) => {
+  const freezeExistingEntries = async (oldTenant, newTenant) => {
     const now = new Date();
     for (let offset = 0; offset < 24; offset++) {
       const d = new Date(now.getFullYear(), now.getMonth() - offset, 1);
@@ -2636,15 +2628,26 @@ function App() {
           const e = entries[ek];
           if (!e.status) continue;
           const p = e.status === 'present';
-          const patch = {};
-          if (e.rentAmount == null) patch.rentAmount = p ? oldTenant.presentFee : oldTenant.absentFee;
-          if (e.motherShare == null) patch.motherShare = p
-            ? (oldTenant.presentMotherShare != null ? oldTenant.presentMotherShare : oldTenant.presentFee)
-            : (oldTenant.absentMotherShare != null ? oldTenant.absentMotherShare : oldTenant.absentFee);
-          if (e.aykaShare == null) patch.aykaShare = p
-            ? (oldTenant.presentAykaShare != null ? oldTenant.presentAykaShare : 0)
-            : (oldTenant.absentAykaShare != null ? oldTenant.absentAykaShare : 0);
-          if (Object.keys(patch).length) { entries[ek] = { ...e, ...patch }; changed = true; }
+          if (!e.signature && offset === 0 && newTenant) {
+            entries[ek].rentAmount = p ? newTenant.presentFee : newTenant.absentFee;
+            entries[ek].aykaShare = p
+              ? (newTenant.presentAykaShare != null ? newTenant.presentAykaShare : Math.round((Number(newTenant.presentFee)||0)*0.7))
+              : (newTenant.absentAykaShare != null ? newTenant.absentAykaShare : Math.round((Number(newTenant.absentFee)||0)*0.7));
+            entries[ek].motherShare = p
+              ? (newTenant.presentMotherShare != null ? newTenant.presentMotherShare : ((Number(newTenant.presentFee)||0) - entries[ek].aykaShare))
+              : (newTenant.absentMotherShare != null ? newTenant.absentMotherShare : ((Number(newTenant.absentFee)||0) - entries[ek].aykaShare));
+            changed = true;
+          } else {
+            const patch = {};
+            if (e.rentAmount == null) patch.rentAmount = p ? oldTenant.presentFee : oldTenant.absentFee;
+            if (e.motherShare == null) patch.motherShare = p
+              ? (oldTenant.presentMotherShare != null ? oldTenant.presentMotherShare : oldTenant.presentFee)
+              : (oldTenant.absentMotherShare != null ? oldTenant.absentMotherShare : oldTenant.absentFee);
+            if (e.aykaShare == null) patch.aykaShare = p
+              ? (oldTenant.presentAykaShare != null ? oldTenant.presentAykaShare : 0)
+              : (oldTenant.absentAykaShare != null ? oldTenant.absentAykaShare : 0);
+            if (Object.keys(patch).length) { entries[ek] = { ...e, ...patch }; changed = true; }
+          }
         }
         if (changed) {
           const jsonVal = JSON.stringify(entries);
@@ -2659,7 +2662,7 @@ function App() {
     let next;
     const existing = tenants.find((x) => x.id === t.id);
     if (existing && PRICE_FIELDS.some((f) => Number(existing[f] ?? 0) !== Number(t[f] ?? 0))) {
-      await freezeExistingEntries(existing);
+      await freezeExistingEntries(existing, t);
     }
     if (existing) {
       next = tenants.map((x) => x.id === t.id ? t : x);
