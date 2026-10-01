@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>Banahaw Food Park - Rent Ledger</title>
+<title>Banahaw Food Park - Rent Ledger v28</title>
 <link rel="manifest" href="./manifest.json" />
 <meta name="theme-color" content="#1B2A4A" />
 <link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png" />
@@ -15,6 +15,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet" />
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
@@ -140,196 +142,223 @@
     });
   }
 
-  // ── Firebase Realtime Database Config & Multi-Device Offline Sync Engine ──
+  // ── Firebase Realtime Database: single-source-of-truth data layer ──
+  // Firebase is authoritative. localStorage is cache/preferences only.
+  // Normal operation uses realtime listeners; no whole-root PUT/restore is used.
   var FIREBASE_DB_URL = "https://banahaw-food-park-default-rtdb.firebaseio.com";
-  var FIREBASE_RECORD_PATH = "banahaw_food_park";
+  var FIREBASE_RECORD_PATH = "banahaw_food_park"; // v28 realtime architecture
   var ACTIVITY_LOG_MAX = 300;
-
+  var CACHE_MONTHS_TO_KEEP = 3;
   var cloudSyncState = "idle";
-
-  function logActivity(action, detail) {
+  var BANHAW_DEVICE_ID = (function () {
     try {
-      var raw = localStorage.getItem("rl:activityLog");
-      var log = raw ? JSON.parse(raw) : [];
-      log.unshift({ ts: new Date().toISOString(), action: action, detail: detail || "" });
-      if (log.length > ACTIVITY_LOG_MAX) log = log.slice(0, ACTIVITY_LOG_MAX);
-      localStorage.setItem("rl:activityLog", JSON.stringify(log));
-      fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + "/activityLog.json", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(log)
-      }).catch(function() {});
-    } catch (e) { console.warn("logActivity failed:", e); }
-  }
-  window.logActivity = logActivity;
+      var k="rl:deviceId", x=localStorage.getItem(k);
+      if(!x){x="dev_"+Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem(k,x);}
+      return x;
+    } catch(e){return "dev_unknown";}
+  })();
 
-  async function syncKeyToCloud(key, value) {
-    try {
-      var safeKey = key.replace(/\./g, "_");
-      var res = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + "/records/" + safeKey + ".json", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ val: value, updatedAt: new Date().toISOString() })
-      });
-      return res.ok;
-    } catch (e) {
-      console.warn("syncKeyToCloud error:", e);
-      return false;
-    }
-  }
+  var firebaseReady=false, firebaseDb=null;
+  try{
+    if(!firebase.apps.length) firebase.initializeApp({databaseURL:FIREBASE_DB_URL});
+    firebaseDb=firebase.database(); firebaseReady=true;
+  }catch(e){console.warn("Firebase initialization failed; offline cache remains available.",e);}
 
-  async function fetchKeyFromCloud(key) {
-    try {
-      var safeKey = key.replace(/\./g, "_");
-      var res = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + "/records/" + safeKey + ".json");
-      if (!res.ok) return null;
-      var data = await res.json();
-      if (data && data.val !== undefined) {
-        try { return JSON.parse(data.val); } catch(e) { return data.val; }
-      }
-      return null;
-    } catch(e) {
-      return null;
-    }
-  }
-
-  function mergeEntries(localEntries, remoteEntries) {
-    if (!remoteEntries) return localEntries || {};
-    if (!localEntries) return remoteEntries || {};
-    var merged = { ...localEntries };
-    Object.keys(remoteEntries).forEach(function(dayKey) {
-      var remoteDay = remoteEntries[dayKey];
-      var localDay = merged[dayKey];
-      if (!localDay) {
-        merged[dayKey] = remoteDay;
-      } else {
-        merged[dayKey] = {
-          ...localDay,
-          status: localDay.status || remoteDay.status,
-          rentAmount: localDay.rentAmount != null ? localDay.rentAmount : remoteDay.rentAmount,
-          motherShare: localDay.motherShare != null ? localDay.motherShare : remoteDay.motherShare,
-          aykaShare: localDay.aykaShare != null ? localDay.aykaShare : remoteDay.aykaShare,
-          amountPaid: localDay.amountPaid != null ? localDay.amountPaid : remoteDay.amountPaid,
-          datePaid: localDay.datePaid || remoteDay.datePaid,
-          coveredDate: localDay.coveredDate || remoteDay.coveredDate,
-          remarks: localDay.remarks || remoteDay.remarks,
-          signature: localDay.signature || remoteDay.signature
+  // ---------- IndexedDB offline outbox ----------
+  var OUTBOX_DB="banahaw_food_park_offline", OUTBOX_STORE="mutations", outboxDbPromise=null;
+  function openOutboxDb(){
+    if(!window.indexedDB) return Promise.resolve(null);
+    if(outboxDbPromise) return outboxDbPromise;
+    outboxDbPromise=new Promise(function(resolve){
+      try{
+        var req=indexedDB.open(OUTBOX_DB,1);
+        req.onupgradeneeded=function(){
+          var db=req.result;
+          if(!db.objectStoreNames.contains(OUTBOX_STORE)){
+            var st=db.createObjectStore(OUTBOX_STORE,{keyPath:"id"});
+            st.createIndex("ts","ts",{unique:false});
+          }
         };
-      }
+        req.onsuccess=function(){resolve(req.result);};
+        req.onerror=function(){resolve(null);};
+      }catch(e){resolve(null);}
     });
-    return merged;
+    return outboxDbPromise;
+  }
+  async function queueMutation(m){
+    var db=await openOutboxDb();
+    if(!db){try{localStorage.setItem("rl:outbox_fallback",JSON.stringify(m));}catch(e){}return;}
+    return new Promise(function(resolve){
+      try{var tx=db.transaction(OUTBOX_STORE,"readwrite");tx.objectStore(OUTBOX_STORE).put(m);tx.oncomplete=resolve;tx.onerror=resolve;}catch(e){resolve();}
+    });
+  }
+  async function readQueuedMutations(){
+    var db=await openOutboxDb(); if(!db)return [];
+    return new Promise(function(resolve){
+      try{
+        var req=db.transaction(OUTBOX_STORE,"readonly").objectStore(OUTBOX_STORE).getAll();
+        req.onsuccess=function(){var a=req.result||[];a.sort(function(x,y){return String(x.ts).localeCompare(String(y.ts));});resolve(a);};
+        req.onerror=function(){resolve([]);};
+      }catch(e){resolve([]);}
+    });
+  }
+  async function removeQueuedMutation(id){var db=await openOutboxDb();if(!db)return;try{db.transaction(OUTBOX_STORE,"readwrite").objectStore(OUTBOX_STORE).delete(id);}catch(e){}}
+
+  function setCloudStatus(state,message){cloudSyncState=state;window.dispatchEvent(new CustomEvent("cloudsync",{detail:message||state}));}
+  function cloudPath(parts){return FIREBASE_RECORD_PATH+"/"+parts.map(function(p){return String(p).replace(/[.#$\[\]]/g,"_");}).join("/");}
+  function keyParts(key){return String(key||"").split(":");}
+  function targetPathForLegacyKey(key){
+    var p=keyParts(key);
+    if(p[0]==="tenants"&&p.length===2)return cloudPath(["tenants",p[1]]);
+    if(p[0]==="entries"&&p.length===4)return cloudPath(["entries",p[1],p[2],p[3]]);
+    if(p[0]==="ambagan"&&p.length===2)return cloudPath(["ambagan",p[1]]);
+    if(p[0]==="activityLog")return cloudPath(["activityLog"]);
+    if(p[0]==="pin")return cloudPath(["settings","pin"]);
+    return cloudPath(["settings",p[0]||"misc"]);
+  }
+  function normalizeTenantCollection(v){
+    if(Array.isArray(v))return v;
+    if(!v||typeof v!=="object")return [];
+    return Object.keys(v).map(function(id){return v[id];}).filter(Boolean);
   }
 
-  function addToOutbox(key, val) {
-    try {
-      var raw = localStorage.getItem("rl:outbox_queue");
-      var queue = raw ? JSON.parse(raw) : [];
-      queue.push({ key: key, val: val, ts: new Date().toISOString() });
-      localStorage.setItem("rl:outbox_queue", JSON.stringify(queue));
-    } catch(e) {}
+  // Firebase snapshots are authoritative. Kept for existing report code that still
+  // calls mergeEntries(local, remote).
+  function mergeEntries(local, remote){
+    if(remote && typeof remote === "object") return remote;
+    return local || {};
+  }
+  function cacheKey(k){return "rl:"+k;}
+  async function cacheGet(k){try{var v=localStorage.getItem(cacheKey(k));return v===null?null:v;}catch(e){return null;}}
+  async function cacheSet(k,v){
+    try{localStorage.setItem(cacheKey(k),v);pruneLocalCache();}
+    catch(e){try{
+      var a=[];for(var i=0;i<localStorage.length;i++){var x=localStorage.key(i);if(x&&x.indexOf("rl:entries:")===0)a.push(x);}
+      for(var j=0;j<a.length;j++)if(a[j]!==cacheKey(k))localStorage.removeItem(a[j]);
+      localStorage.setItem(cacheKey(k),v);
+    }catch(e2){}}
+  }
+  function pruneLocalCache(){
+    try{
+      var now=new Date(),keep={};
+      for(var i=0;i<CACHE_MONTHS_TO_KEEP;i++){var d=new Date(now.getFullYear(),now.getMonth()-i,1);keep[d.getFullYear()+"-"+pad(d.getMonth()+1)]=true;}
+      var remove=[];
+      for(var j=0;j<localStorage.length;j++){var k=localStorage.key(j),m=k&&k.match(/^rl:entries:.*:(\d{4}-\d{2})$/);if(m&&!keep[m[1]])remove.push(k);}
+      remove.forEach(function(k){localStorage.removeItem(k);});
+    }catch(e){}
   }
 
-  async function flushOutbox() {
-    try {
-      var raw = localStorage.getItem("rl:outbox_queue");
-      if (!raw) return;
-      var queue = JSON.parse(raw);
-      if (!queue || queue.length === 0) return;
-      var remaining = [];
-      for (var i = 0; i < queue.length; i++) {
-        var item = queue[i];
-        var ok = await syncKeyToCloud(item.key, item.val);
-        if (!ok) {
-          remaining.push(item);
+  async function fetchKeyFromCloud(key){
+    if(!firebaseReady||!firebaseDb)return null;
+    try{var v=await firebaseDb.ref(targetPathForLegacyKey(key)).once("value").then(function(s){return s.val();});
+      return keyParts(key)[0]==="tenants"?normalizeTenantCollection(v):v;
+    }catch(e){console.warn("Firebase read failed:",e);return null;}
+  }
+  function subscribeKeyFromCloud(key,onValue){
+    if(!firebaseReady||!firebaseDb)return function(){};
+    var ref=firebaseDb.ref(targetPathForLegacyKey(key));
+    var handler=function(snap){var v=snap.val();if(keyParts(key)[0]==="tenants")v=normalizeTenantCollection(v);try{cacheSet(key,JSON.stringify(v));}catch(e){}onValue(v,{source:"firebase"});};
+    ref.on("value",handler);return function(){try{ref.off("value",handler);}catch(e){}};
+  }
+  window.subscribeKeyFromCloud=subscribeKeyFromCloud;
+
+  // Writes one ledger day only. A transaction merges the patch with the latest Firebase day,
+  // preventing a stale device from erasing another device's signature/payment fields.
+  async function syncEntryDay(category,tenantId,month,dayKey,patch,mutationTime){
+    var path=cloudPath(["entries",category,tenantId,month,dayKey]), ts=mutationTime||new Date().toISOString();
+    if(!firebaseReady||!firebaseDb){await queueMutation({id:Date.now()+"_"+Math.random(),kind:"entryDay",path:path,patch:patch,ts:ts,deviceId:BANHAW_DEVICE_ID});return false;}
+    try{
+      var result=await firebaseDb.ref(path).transaction(function(current){
+        var next=(current&&typeof current==="object")?Object.assign({},current):{};
+        Object.keys(patch||{}).forEach(function(k){if(patch[k]===undefined)delete next[k];else next[k]=patch[k];});
+        next._meta={updatedAt:ts,updatedBy:BANHAW_DEVICE_ID};return next;
+      });
+      if(!result.committed){
+        await queueMutation({id:Date.now()+"_"+Math.random(),kind:"entryDay",path:path,patch:patch,ts:ts,deviceId:BANHAW_DEVICE_ID});
+      } else if (Object.prototype.hasOwnProperty.call(patch || {}, "signature")) {
+        var sidPath = cloudPath(["signatures",tenantId+"__"+dayKey]);
+        var sigValue = patch.signature;
+        if (sigValue) {
+          await firebaseDb.ref(sidPath).set({tenantId:tenantId,category:category,date:dayKey,image:sigValue,updatedAt:ts,updatedBy:BANHAW_DEVICE_ID,active:true});
+        } else {
+          await firebaseDb.ref(sidPath).update({active:false,updatedAt:ts,updatedBy:BANHAW_DEVICE_ID});
         }
       }
-      if (remaining.length > 0) {
-        localStorage.setItem("rl:outbox_queue", JSON.stringify(remaining));
-      } else {
-        localStorage.removeItem("rl:outbox_queue");
-      }
-    } catch(e) {}
+      return !!result.committed;
+    }catch(e){await queueMutation({id:Date.now()+"_"+Math.random(),kind:"entryDay",path:path,patch:patch,ts:ts,deviceId:BANHAW_DEVICE_ID});return false;}
   }
+  window.syncEntryDay=syncEntryDay;
 
-  window.addEventListener("online", flushOutbox);
-  setInterval(flushOutbox, 10000);
-
-  async function cloudBackup() {
-    await flushOutbox();
-    var data = {};
-    var records = {};
-    for (var i = 0; i < localStorage.length; i++) {
-      var k = localStorage.key(i);
-      if (k && k.startsWith('rl:')) {
-        var rawVal = localStorage.getItem(k);
-        data[k] = rawVal;
-        var cleanKey = k.substring(3).replace(/\./g, "_");
-        records[cleanKey] = { val: rawVal, updatedAt: new Date().toISOString() };
-      }
-    }
-    var nowIso = new Date().toISOString();
-    var res = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + ".json", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ data: data, records: records, lastBackup: nowIso })
-    });
-    if (!res.ok) throw new Error("Firebase write failed: " + res.status);
-    return true;
-  }
-
-  async function cloudRestore() {
-    var res = await fetch(FIREBASE_DB_URL + "/" + FIREBASE_RECORD_PATH + ".json");
-    if (!res.ok) throw new Error("Firebase read failed: " + res.status);
-    var val = await res.json();
-    if (!val) throw new Error('No backup found');
-    var remoteData = {};
-    if (val.records) {
-      Object.keys(val.records).forEach(function(rk) {
-        var origKey = "rl:" + rk;
-        var rawVal = val.records[rk].val;
-        remoteData[origKey] = rawVal;
+  async function syncTenants(category,list,mutationTime,baseList){
+    var path=cloudPath(["tenants",category]),desired=Array.isArray(list)?list:[],base=Array.isArray(baseList)?baseList:[],ts=mutationTime||new Date().toISOString();
+    if(!firebaseReady||!firebaseDb){await queueMutation({id:Date.now()+"_"+Math.random(),kind:"tenants",path:path,value:desired,ts:ts,deviceId:BANHAW_DEVICE_ID});return false;}
+    try{
+      var result=await firebaseDb.ref(path).transaction(function(current){
+        var cur=normalizeTenantCollection(current),byId={};cur.forEach(function(t){if(t&&t.id)byId[t.id]=t;});
+        var baseById={};base.forEach(function(t){if(t&&t.id)baseById[t.id]=t;});
+        var desiredById={};desired.forEach(function(t){if(t&&t.id)desiredById[t.id]=t;});
+        Object.keys(desiredById).forEach(function(id){byId[id]=desiredById[id];});
+        // Only delete an ID if it existed in this device's base snapshot. A concurrent
+        // tenant added by another device is therefore preserved.
+        Object.keys(baseById).forEach(function(id){if(!desiredById[id])delete byId[id];});
+        return byId;
       });
-    } else if (val.data) {
-      remoteData = val.data;
-    }
-
-    Object.keys(remoteData).forEach(function(k) {
-      if (k.startsWith('rl:')) {
-        var existing = localStorage.getItem(k);
-        if (existing && k.startsWith('rl:entries:')) {
-          try {
-            var mergedObj = mergeEntries(JSON.parse(existing), JSON.parse(remoteData[k]));
-            localStorage.setItem(k, JSON.stringify(mergedObj));
-            return;
-          } catch(e) {}
-        }
-        localStorage.setItem(k, remoteData[k]);
-      }
-    });
-    return val.lastBackup || new Date().toISOString();
+      if(!result.committed)await queueMutation({id:Date.now()+"_"+Math.random(),kind:"tenants",path:path,value:desired,ts:ts,deviceId:BANHAW_DEVICE_ID});
+      return !!result.committed;
+    }catch(e){await queueMutation({id:Date.now()+"_"+Math.random(),kind:"tenants",path:path,value:desired,ts:ts,deviceId:BANHAW_DEVICE_ID});return false;}
   }
 
-  function autoBackupToCloud(specificKey, specificVal) {
-    if (specificKey && specificVal !== undefined) {
-      addToOutbox(specificKey, specificVal);
-      syncKeyToCloud(specificKey, specificVal).then(function(ok) {
-        if (ok) flushOutbox();
-      });
-    }
-    clearTimeout(window._autoBackupTimer);
-    window._autoBackupTimer = setTimeout(function() {
-      cloudSyncState = "syncing";
-      window.dispatchEvent(new CustomEvent("cloudsync", { detail: "syncing" }));
-      cloudBackup().then(function() {
-        cloudSyncState = "synced";
-        window.dispatchEvent(new CustomEvent("cloudsync", { detail: "synced" }));
-      }).catch(function(e) {
-        console.warn('Auto-backup failed:', e);
-        cloudSyncState = "error";
-        window.dispatchEvent(new CustomEvent("cloudsync", { detail: "error" }));
-      });
-    }, 1500);
+  async function syncLegacyKeyToCloud(key,value,mutationTime,baseValue){
+    var p=keyParts(key),ts=mutationTime||new Date().toISOString();
+    if(p[0]==="tenants"&&p.length===2)return syncTenants(p[1],JSON.parse(value),ts,baseValue||[]);
+    var path=targetPathForLegacyKey(key),val;try{val=JSON.parse(value);}catch(e){val=value;}
+    if(!firebaseReady||!firebaseDb){await queueMutation({id:Date.now()+"_"+Math.random(),kind:"set",path:path,value:val,ts:ts,deviceId:BANHAW_DEVICE_ID});return false;}
+    try{await firebaseDb.ref(path).set(val);return true;}catch(e){await queueMutation({id:Date.now()+"_"+Math.random(),kind:"set",path:path,value:val,ts:ts,deviceId:BANHAW_DEVICE_ID});return false;}
   }
+
+  async function flushOutbox(){
+    if(!navigator.onLine||!firebaseReady)return;
+    var list=await readQueuedMutations();
+    for(var i=0;i<list.length;i++){
+      var item=list[i],ok=false;
+      try{
+        if(item.kind==="entryDay"){
+          var snap=await firebaseDb.ref(item.path).once("value"),current=snap.val()||{},next=Object.assign({},current);
+          Object.keys(item.patch||{}).forEach(function(k){if(item.patch[k]===undefined)delete next[k];else next[k]=item.patch[k];});
+          next._meta={updatedAt:item.ts,updatedBy:item.deviceId||BANHAW_DEVICE_ID};await firebaseDb.ref(item.path).set(next);
+          if(Object.prototype.hasOwnProperty.call(item.patch||{},"signature")){
+            var seg=item.path.split("/");
+            var cat=seg[2],tid=seg[3],day=seg[5],sp=cloudPath(["signatures",tid+"__"+day]);
+            if(item.patch.signature) await firebaseDb.ref(sp).set({tenantId:tid,category:cat,date:day,image:item.patch.signature,updatedAt:item.ts,updatedBy:item.deviceId||BANHAW_DEVICE_ID,active:true});
+            else await firebaseDb.ref(sp).update({active:false,updatedAt:item.ts,updatedBy:item.deviceId||BANHAW_DEVICE_ID});
+          }
+        }else await firebaseDb.ref(item.path).set(item.value);
+        ok=true;
+      }catch(e){ok=false;}
+      if(ok)await removeQueuedMutation(item.id);
+    }
+    setCloudStatus("synced","Database Synced ✓");
+  }
+  window.addEventListener("online",function(){flushOutbox();});
+  window.addEventListener("offline",function(){setCloudStatus("offline","Offline — changes will sync automatically");});
+  setInterval(function(){if(navigator.onLine)flushOutbox();},15000);
+
+  // UI compatibility. This is cache only; callers explicitly sync changes.
+  window.storage={
+    get:async function(k){var v=await cacheGet(k);if(v===null)throw new Error("not found");return{key:k,value:v};},
+    set:async function(k,v){await cacheSet(k,v);return{key:k,value:v};},
+    delete:async function(k){try{localStorage.removeItem(cacheKey(k));}catch(e){}return{key:k,deleted:true};}
+  };
+
+  function logActivity(action,detail){
+    try{var raw=localStorage.getItem("rl:activityLog"),log=raw?JSON.parse(raw):[];log.unshift({ts:new Date().toISOString(),action:action,detail:detail||"",deviceId:BANHAW_DEVICE_ID});if(log.length>ACTIVITY_LOG_MAX)log=log.slice(0,ACTIVITY_LOG_MAX);localStorage.setItem("rl:activityLog",JSON.stringify(log));syncLegacyKeyToCloud("activityLog",JSON.stringify(log));}catch(e){console.warn("logActivity failed:",e);}
+  }
+  window.logActivity=logActivity;
+  function autoBackupToCloud(key,val){if(!key||val===undefined)return;setCloudStatus("syncing","Saving to database…");syncLegacyKeyToCloud(key,val).then(function(ok){setCloudStatus(ok?"synced":"offline",ok?"Database Synced ✓":"Offline — changes will sync automatically");}).catch(function(){setCloudStatus("offline","Offline — changes will sync automatically");});}
+
+  // Kept only for old button handlers. These never replace Firebase with local data.
+  async function cloudBackup(){await flushOutbox();setCloudStatus("synced","Database Synced ✓");return true;}
+  async function cloudRestore(){if(!firebaseReady)throw new Error("Firebase unavailable");return true;}
 
   function compressSignatureCanvas(canvas) {
     try {
@@ -1018,7 +1047,7 @@ function DayDetailsModal({ day, dateStr, tenant, entry, onSave, onClose }) {
   );
 }
 
-function Ledger({ tenant, onBack }) {
+function Ledger({ tenant, onBack, onCustomerView }) {
   const today = new Date();
   const [year, setYear] = useState(today.getFullYear());
   const [month, setMonth] = useState(today.getMonth() + 1);
@@ -1041,21 +1070,19 @@ function Ledger({ tenant, onBack }) {
     setEntries(localData);
     setLoaded(true);
 
-    fetchKeyFromCloud(storeKey).then((remoteData) => {
-      if (remoteData) {
-        const merged = mergeEntries(localData, remoteData);
-        setEntries(merged);
-        window.storage.set(storeKey, JSON.stringify(merged)).catch(() => {});
-      }
-    });
 
     let pm = month - 1, py = year;
     if (pm < 1) { pm = 12; py--; }
     const prevKey = `entries:${tenant.category}:${tenant.id}:${py}-${pad(pm)}`;
     try {
-      const pr = await window.storage.get(prevKey);
-      if (pr && pr.value) {
-        const prevEntries = JSON.parse(pr.value);
+      let prevEntries = {};
+      const pr = await window.storage.get(prevKey).catch(() => null);
+      if (pr && pr.value) prevEntries = JSON.parse(pr.value);
+      if (!Object.keys(prevEntries).length) {
+        const remotePrev = await fetchKeyFromCloud(prevKey);
+        if (remotePrev) { prevEntries = remotePrev; window.storage.set(prevKey, JSON.stringify(remotePrev)).catch(() => {}); }
+      }
+      if (Object.keys(prevEntries).length) {
         const prevDays = dim(py, pm);
         let pTotal = 0, pPresent = 0, pAbsent = 0, pGarb = 0;
         for (let d = 1; d <= prevDays; d++) {
@@ -1067,44 +1094,36 @@ function Ledger({ tenant, onBack }) {
           pGarb += garb;
         }
         setPrevMonthData({ total: pTotal, present: pPresent, absent: pAbsent, garbage: pGarb, days: prevDays, month: MONTHS[pm - 1] });
-      } else {
-        setPrevMonthData(null);
-      }
+      } else setPrevMonthData(null);
     } catch { setPrevMonthData(null); }
   }, [storeKey, month, year, tenant]);
 
   useEffect(() => { loadMonth(); }, [loadMonth]);
 
   useEffect(() => {
-    const pollTimer = setInterval(async () => {
-      const remoteData = await fetchKeyFromCloud(storeKey);
+    // True Firebase realtime listener: other devices update this ledger automatically.
+    const unsubscribe = window.subscribeKeyFromCloud(storeKey, (remoteData) => {
       if (remoteData) {
-        setEntries((prev) => {
-          const merged = mergeEntries(prev, remoteData);
-          window.storage.set(storeKey, JSON.stringify(merged)).catch(() => {});
-          return merged;
-        });
+        setEntries(remoteData);
+        window.storage.set(storeKey, JSON.stringify(remoteData)).catch(() => {});
+        setCloudStatus("synced", "Database updated ✓");
       }
-    }, 8000);
-    return () => clearInterval(pollTimer);
+    });
+    return () => unsubscribe();
   }, [storeKey]);
 
   const flash = (msg) => { setSaveNote(msg || "Saved ✓"); clearTimeout(saveTimer.current); saveTimer.current = setTimeout(() => setSaveNote(""), 1400); };
   
-  const persist = async (next) => {
+  const persist = async (next, changedDay, cloudPatch) => {
     setEntries(next);
     const jsonVal = JSON.stringify(next);
-    try {
-      const res = await window.storage.set(storeKey, jsonVal);
-      if (res && res.warning) {
-        flash("Synced directly to Cloud ✓");
-      } else {
-        flash("Saved ✓");
-      }
-      autoBackupToCloud(storeKey, jsonVal);
-    } catch (err) {
-      console.warn("Storage error fallback:", err);
-      flash("Synced directly to Cloud ✓");
+    try { await window.storage.set(storeKey, jsonVal); } catch (err) { console.warn("Local cache error:", err); }
+    flash("Saved ✓");
+    if (changedDay && typeof window.syncEntryDay === "function") {
+      const mutationTime = new Date().toISOString();
+      window.syncEntryDay(tenant.category, tenant.id, `${year}-${pad(month)}`, changedDay, cloudPatch || next[changedDay] || {}, mutationTime)
+        .then(ok => setCloudStatus(ok ? "synced" : "offline", ok ? "Database Synced ✓" : "Offline — changes will sync automatically"));
+    } else {
       autoBackupToCloud(storeKey, jsonVal);
     }
   };
@@ -1131,7 +1150,7 @@ function Ledger({ tenant, onBack }) {
       patch.motherShare = undefined;
       patch.aykaShare = undefined;
     }
-    persist({ ...entries, [k]: { ...existing, ...patch } });
+    persist({ ...entries, [k]: { ...existing, ...patch } }, k, patch);
     if ("status" in patch) {
       const action = patch.status === "present" ? "Marked Present" : patch.status === "absent" ? "Marked Absent" : "Cleared status";
       window.logActivity(action, `${tenant.name} — ${dayLabel(d)}`);
@@ -1421,6 +1440,7 @@ function Ledger({ tenant, onBack }) {
           <button onClick={() => changeMonth(-1)} className="btn-hover" style={{ padding: "8px 14px", background: "#fff", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 16, cursor: "pointer", color: C.ink }}>‹</button>
           <span className="fade-in" style={{ fontSize: 18, fontWeight: 700, minWidth: 170, textAlign: "center", fontFamily: "'DM Serif Display', Georgia, serif", color: C.navy }}>{MONTHS[month - 1]} {year}</span>
           <button onClick={() => changeMonth(1)} className="btn-hover" style={{ padding: "8px 14px", background: "#fff", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 16, cursor: "pointer", color: C.ink }}>›</button>
+          <button onClick={() => onCustomerView && onCustomerView(tenant)} className="btn-hover" style={{ padding: "8px 14px", background: C.navy, color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>✍️ Customer View</button>
           <button onClick={downloadPdf} className="btn-hover ripple" style={{ padding: "8px 16px", background: C.gold, color: "#fff", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>📥 PDF</button>
         </div>
 
@@ -1687,8 +1707,6 @@ function CategoryScreen({ onSelect, onLock, onCloudBackup, onCloudRestore, cloud
         </div>
         <div style={{ marginTop: 28, paddingTop: 20, borderTop: `1px dashed ${C.border}`, display: "flex", justifyContent: "center", gap: 10, flexWrap: "wrap" }}>
           <button onClick={() => { doBackup(); }} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 12, color: C.inkS, cursor: "pointer" }}>💾 Save File</button>
-          <button onClick={onCloudBackup} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.green}`, borderRadius: 8, fontSize: 12, color: C.green, cursor: "pointer", fontWeight: 600 }}>🔄 Sync Now</button>
-          <button onClick={() => setConfirmingRestore(true)} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.gold}`, borderRadius: 8, fontSize: 12, color: C.gold, cursor: "pointer", fontWeight: 600 }}>♻️ Restore</button>
           <button onClick={() => setShowLog(true)} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.gold}`, borderRadius: 8, fontSize: 12, color: C.gold, cursor: "pointer", fontWeight: 600 }}>📜 History</button>
           <button onClick={onLock} style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 12, color: C.inkS, cursor: "pointer" }}>🔒 Lock</button>
           {!isInstalled && <button onClick={handleInstall} className="btn-hover" style={{ padding: "7px 14px", background: "transparent", border: `1px solid ${C.navy}`, borderRadius: 8, fontSize: 12, color: C.navy, cursor: "pointer", fontWeight: 600 }}>📲 Install App</button>}
@@ -2569,8 +2587,136 @@ function UnpaidTenants({ category, onBack }) {
   );
 }
 
+
+function DashboardScreen({ onSelectCategory, onLock, cloudStatus }) {
+  const [stats, setStats] = useState({ tenants: 0, present: 0, absent: 0, balance: 0 });
+  const [online, setOnline] = useState(navigator.onLine);
+
+  useEffect(() => {
+    const refresh = async () => {
+      let totalTenants = 0, present = 0, absent = 0, balance = 0;
+      const today = new Date();
+      const y = today.getFullYear(), m = today.getMonth() + 1, d = today.getDate();
+      for (const cat of Object.keys(CATEGORY_LABELS)) {
+        try {
+          const r = await window.storage.get(`tenants:${cat}`);
+          const list = r && r.value ? JSON.parse(r.value) : [];
+          totalTenants += Array.isArray(list) ? list.length : 0;
+          if (!Array.isArray(list)) continue;
+          for (const t of list) {
+            try {
+              const er = await window.storage.get(`entries:${cat}:${t.id}:${y}-${pad(m)}`);
+              const entries = er && er.value ? JSON.parse(er.value) : {};
+              const e = entries[dk(y,m,d)];
+              if (e && e.status === 'present') present++;
+              if (e && e.status === 'absent') absent++;
+              if (e) balance += Math.max(0, rowTot(e,t) - rowPaid(e,t));
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }
+      setStats({ tenants: totalTenants, present, absent, balance });
+    };
+    refresh();
+    const onlineHandler = () => setOnline(true);
+    const offlineHandler = () => setOnline(false);
+    window.addEventListener('online', onlineHandler);
+    window.addEventListener('offline', offlineHandler);
+    const timer = setInterval(refresh, 5000);
+    return () => { clearInterval(timer); window.removeEventListener('online', onlineHandler); window.removeEventListener('offline', offlineHandler); };
+  }, []);
+
+  const cats = [
+    ['foodtruck', '🚚', 'Food Trucks'],
+    ['mobilecart', '🛒', 'Mobile Carts'],
+    ['tent2x2', '⛺', 'Tent 2×2 Spaces']
+  ];
+
+  return (
+    <div style={{ minHeight:'100vh', background:C.paper, paddingBottom:40 }}>
+      <div style={{ background:`linear-gradient(135deg, ${C.navy} 0%, ${C.navyL} 100%)`, color:'#fff', padding:'30px 20px 26px' }}>
+        <div style={{ maxWidth:960, margin:'0 auto' }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:12 }}>
+            <div>
+              <div style={{ fontSize:28, fontWeight:700, fontFamily:"'DM Serif Display', Georgia, serif" }}>Banahaw Food Park</div>
+              <div style={{ fontSize:12, opacity:.75, marginTop:4 }}>Management Dashboard</div>
+            </div>
+            <button onClick={onLock} style={{ background:'rgba(255,255,255,.12)', color:'#fff', border:'1px solid rgba(255,255,255,.2)', borderRadius:8, padding:'7px 12px', cursor:'pointer' }}>🔒 Lock</button>
+          </div>
+          <div style={{ marginTop:16, fontSize:12, display:'inline-flex', alignItems:'center', gap:7, padding:'6px 10px', borderRadius:20, background:'rgba(255,255,255,.1)' }}>
+            <span style={{ width:8, height:8, borderRadius:'50%', background:online ? '#7DDA91' : '#F5A6A0' }}></span>
+            {online ? 'Online' : 'Offline — cached data'} {cloudStatus ? `· ${cloudStatus}` : ''}
+          </div>
+        </div>
+      </div>
+      <div style={{ maxWidth:960, margin:'0 auto', padding:'20px' }}>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(170px,1fr))', gap:10, marginBottom:20 }}>
+          {[
+            ['Total Tenants', stats.tenants, C.navy],
+            ['Present Today', stats.present, C.green],
+            ['Absent Today', stats.absent, C.red],
+            ['Outstanding Balance', peso(stats.balance), C.gold]
+          ].map(([label,value,color]) => <div key={label} style={{ background:'#fff', border:`1px solid ${C.borderL}`, borderRadius:12, padding:'16px 18px', boxShadow:'0 1px 3px rgba(0,0,0,.04)' }}><div style={{fontSize:10,fontWeight:700,color:C.inkS,textTransform:'uppercase'}}>{label}</div><div style={{fontSize:22,fontWeight:700,color,marginTop:6,fontFamily:"'JetBrains Mono',monospace"}}>{value}</div></div>)}
+        </div>
+        <div style={{ fontSize:17, fontWeight:700, color:C.navy, marginBottom:10 }}>Categories</div>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(220px,1fr))', gap:12 }}>
+          {cats.map(([cat,icon,label]) => <button key={cat} onClick={() => onSelectCategory(cat)} className="hover-lift" style={{ background:'#fff', border:`1px solid ${C.borderL}`, borderRadius:12, padding:18, textAlign:'left', cursor:'pointer', display:'flex', alignItems:'center', gap:12 }}><span style={{fontSize:30}}>{icon}</span><span><b style={{display:'block',fontSize:15,color:C.ink}}>{label}</b><span style={{fontSize:11,color:C.inkS}}>Open tenant list →</span></span></button>)}
+        </div>
+        <div style={{ marginTop:20, padding:14, background:C.goldBg, border:`1px solid ${C.goldLight || '#F5DFA0'}`, borderRadius:10, fontSize:12, color:C.inkS }}><b style={{color:C.navy}}>Quick access:</b> Choose a category above to manage tenants, view the ledger, reports, Ambagan, and unpaid list.</div>
+      </div>
+    </div>
+  );
+}
+
+function CustomerView({ tenant, onBack }) {
+  const today = new Date();
+  const [year,setYear] = useState(today.getFullYear());
+  const [month,setMonth] = useState(today.getMonth()+1);
+  const [entries,setEntries] = useState({});
+  const [signingDate,setSigningDate] = useState(null);
+  const storeKey = `entries:${tenant.category}:${tenant.id}:${year}-${pad(month)}`;
+
+  const load = useCallback(async () => {
+    let local = {};
+    try { const r=await window.storage.get(storeKey); if(r&&r.value)local=JSON.parse(r.value); } catch(_) {}
+    setEntries(local);
+  },[storeKey]);
+  useEffect(()=>{load();},[load]);
+  useEffect(()=>{
+    return window.subscribeKeyFromCloud(storeKey, remote => {
+      if (remote) { setEntries(remote); window.storage.set(storeKey,JSON.stringify(remote)).catch(()=>{}); }
+    });
+  },[storeKey]);
+
+  const getEntry = d => entries[dk(year,month,d)] || {status:null,signature:null};
+  const saveSignature = async (d, signature) => {
+    const key=dk(year,month,d);
+    const next={...entries,[key]:{...getEntry(d),signature}};
+    setEntries(next);
+    try { await window.storage.set(storeKey,JSON.stringify(next)); } catch(_) {}
+    if (typeof window.syncEntryDay === 'function') {
+      const ok = await window.syncEntryDay(tenant.category,tenant.id,`${year}-${pad(month)}`,key,{signature},new Date().toISOString());
+      setCloudStatus(ok ? 'synced' : 'offline', ok ? 'Database Synced ✓' : 'Offline — changes will sync automatically');
+    }
+    setSigningDate(null);
+    window.logActivity(signature ? 'Customer signature saved' : 'Customer signature cleared', `${tenant.name} — ${key}`);
+  };
+  const days=Array.from({length:dim(year,month)},(_,i)=>i+1);
+  const changeMonth=delta=>{let m=month+delta,y=year;if(m>12){m=1;y++;}if(m<1){m=12;y--;}setMonth(m);setYear(y);};
+  return <div style={{minHeight:'100vh',background:C.paper,paddingBottom:60}}>
+    <div style={{background:`linear-gradient(135deg, ${C.navy} 0%, ${C.navyL} 100%)`,color:'#fff',padding:'24px 20px 18px'}}><div style={{maxWidth:960,margin:'0 auto'}}><button onClick={onBack} style={{background:'rgba(255,255,255,.12)',border:'1px solid rgba(255,255,255,.18)',borderRadius:8,padding:'6px 12px',color:'#fff',cursor:'pointer',marginBottom:12}}>← Back to Ledger</button><div style={{fontSize:22,fontWeight:700}}>Customer View</div><div style={{fontSize:13,opacity:.8,marginTop:4}}>{tenant.name} · {categoryLabel(tenant.category)}</div></div></div>
+    <div style={{maxWidth:960,margin:'0 auto',padding:'20px'}}>
+      <div style={{textAlign:'center',marginBottom:18}}><button onClick={()=>changeMonth(-1)} style={{padding:'7px 13px',border:`1px solid ${C.border}`,background:'#fff',borderRadius:8,cursor:'pointer'}}>‹</button><span style={{display:'inline-block',minWidth:170,fontWeight:700,color:C.navy}}>{MONTHS[month-1]} {year}</span><button onClick={()=>changeMonth(1)} style={{padding:'7px 13px',border:`1px solid ${C.border}`,background:'#fff',borderRadius:8,cursor:'pointer'}}>›</button></div>
+      <div style={{background:'#fff',border:`1px solid ${C.borderL}`,borderRadius:12,overflow:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}><thead><tr style={{background:C.paper}}>{['Date','Status','Amount Due','Amount Paid','Balance','Covered Date','Date Paid','Remarks','Signature'].map(h=><th key={h} style={{padding:'10px 8px',textAlign:'left',borderBottom:`1px solid ${C.borderL}`,whiteSpace:'nowrap'}}>{h}</th>)}</tr></thead><tbody>{days.map(d=>{const e=getEntry(d);const due=rowTot(e,tenant),paid=rowPaid(e,tenant),bal=Math.max(0,due-paid);return <tr key={d}><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{MONTHS[month-1].slice(0,3)} {d}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`,color:e.status==='present'?C.green:e.status==='absent'?C.red:C.inkS,fontWeight:600}}>{e.status||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{peso(due)}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{peso(paid)}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`,color:bal>0?C.red:C.green,fontWeight:700}}>{peso(bal)}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.coveredDate||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.datePaid||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.remarks||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.signature?<div style={{display:'flex',alignItems:'center',gap:6}}><img src={e.signature} alt="Signature" style={{height:28,maxWidth:90}}/><button onClick={()=>setSigningDate(d)} style={{fontSize:10,padding:'4px 7px',border:`1px solid ${C.border}`,background:'#fff',borderRadius:6,cursor:'pointer'}}>Edit</button></div>:<button onClick={()=>setSigningDate(d)} style={{padding:'6px 9px',background:C.navy,color:'#fff',border:'none',borderRadius:6,fontSize:11,cursor:'pointer'}}>✍️ Sign</button>}</td></tr>})}</tbody></table></div>
+      <div style={{marginTop:12,fontSize:11,color:C.inkS}}>Customer View shows customer-facing information only. Internal Ayka Share and Mother Share details are not displayed.</div>
+    </div>
+    {signingDate && <SignaturePad initial={getEntry(signingDate).signature} onClose={()=>setSigningDate(null)} onSave={sig=>saveSignature(signingDate,sig)}/>} 
+  </div>;
+}
+
 function App() {
   const [screen, setScreen] = useState("lock");
+  const [customerTenant, setCustomerTenant] = useState(null);
   const [category, setCategory] = useState(null);
   const [tenants, setTenants] = useState([]);
   const [activeTenant, setActiveTenant] = useState(null);
@@ -2581,7 +2727,8 @@ function App() {
     const onSync = (e) => {
       if (e.detail === "syncing") setCloudStatus("Syncing database…");
       else if (e.detail === "synced") { setCloudStatus("Database Synced ✓"); setTimeout(() => setCloudStatus(""), 2500); }
-      else if (e.detail === "error") { setCloudStatus("Offline — using cached data"); setTimeout(() => setCloudStatus(""), 3500); }
+      else if (e.detail === "error" || e.detail === "offline") { setCloudStatus("Offline — changes will sync automatically"); setTimeout(() => setCloudStatus(""), 3500); }
+      else if (e.detail) { setCloudStatus(String(e.detail)); setTimeout(() => setCloudStatus(""), 2200); }
     };
     window.addEventListener("cloudsync", onSync);
     return () => window.removeEventListener("cloudsync", onSync);
@@ -2589,19 +2736,13 @@ function App() {
 
   useEffect(() => {
     (async () => {
-      try {
-        await cloudRestore();
-      } catch (e) {
-        console.log("Initial cloud sync note:", e);
-      }
-    })();
-  }, []);
-
-  useEffect(() => {
-    (async () => {
+      // Firebase is the source of truth. On every app start, load the existing
+      // Firebase records into the local cache FIRST, without ever writing back
+      // Firebase is loaded through realtime listeners and targeted reads.
+      // There is intentionally no destructive startup restore.
       try {
         if (sessionStorage.getItem("rl_unlocked") === "1") {
-          setScreen("category");
+          setScreen("dashboard");
           return;
         }
         const pinExists = await window.storage.get("pin");
@@ -2616,6 +2757,19 @@ function App() {
     })();
   }, []);
 
+  // Keep the currently selected tenant list live across every device.
+  useEffect(() => {
+    if (!category) return;
+    const key = `tenants:${category}`;
+    const unsubscribe = window.subscribeKeyFromCloud(key, (remoteList) => {
+      if (Array.isArray(remoteList)) {
+        setTenants(remoteList);
+        window.storage.set(key, JSON.stringify(remoteList)).catch(() => {});
+      }
+    });
+    return () => unsubscribe();
+  }, [category]);
+
   const loadTenants = async (cat) => {
     const key = `tenants:${cat}`;
     let list = [];
@@ -2623,22 +2777,24 @@ function App() {
       const r = await window.storage.get(key);
       if (r && r.value) list = JSON.parse(r.value);
     } catch {}
-    if (!list || list.length === 0) {
-      try {
-        const cloudList = await fetchKeyFromCloud(key);
-        if (cloudList && Array.isArray(cloudList) && cloudList.length > 0) {
-          list = cloudList;
-          await window.storage.set(key, JSON.stringify(list)).catch(() => {});
-        }
-      } catch(e) {}
-    }
+    // Local cache is only the instant fallback; Firebase remains authoritative.
+    try {
+      const cloudList = await fetchKeyFromCloud(key);
+      if (cloudList && Array.isArray(cloudList)) {
+        list = cloudList;
+        await window.storage.set(key, JSON.stringify(list)).catch(() => {});
+      }
+    } catch(e) {}
     return list || [];
   };
   const saveSession = async (cat, tid) => { try { await window.storage.set("session", JSON.stringify({ category: cat, tenantId: tid || null })); } catch {} };
   const saveTenants = async (cat, list) => {
     const storeKey = `tenants:${cat}`;
     const jsonVal = JSON.stringify(list);
-    try { await window.storage.set(storeKey, jsonVal); autoBackupToCloud(storeKey, jsonVal); } catch {}
+    try { await window.storage.set(storeKey, jsonVal); } catch {}
+    if (typeof syncTenants === 'function') {
+      await syncTenants(cat, list, new Date().toISOString(), tenants);
+    }
   };
 
   const handleCategorySelect = async (cat) => {
@@ -2755,13 +2911,16 @@ function App() {
     setScreen("lock");
     setActiveTenant(null);
     setCategory(null);
+    setCustomerTenant(null);
     try { window.storage.delete("session"); } catch {}
     try { sessionStorage.removeItem("rl_unlocked"); } catch {}
   };
 
   return (
     <>
-      {screen === "lock" && <LockScreen onUnlock={() => { try { sessionStorage.setItem("rl_unlocked", "1"); } catch {} setScreen("category"); setCategory(null); }} />}
+      {screen === "lock" && <LockScreen onUnlock={() => { try { sessionStorage.setItem("rl_unlocked", "1"); } catch {} setScreen("dashboard"); setCategory(null); }} />}
+
+      {screen === "dashboard" && <DashboardScreen onSelectCategory={handleCategorySelect} onLock={handleLock} cloudStatus={cloudStatus} />}
 
       {screen === "category" && <CategoryScreen onSelect={handleCategorySelect} onLock={handleLock} onCloudBackup={handleCloudBackup} onCloudRestore={handleCloudRestore} cloudStatus={cloudStatus} />}
 
@@ -2781,8 +2940,10 @@ function App() {
       )}
 
       {screen === "ledger" && activeTenant && (
-        <Ledger tenant={activeTenant} onBack={() => { setActiveTenant(null); setScreen("tenantList"); saveSession(category, null); }} />
+        <Ledger tenant={activeTenant} onBack={() => { setActiveTenant(null); setScreen("tenantList"); saveSession(category, null); }} onCustomerView={(t) => { setCustomerTenant(t); setScreen("customerView"); }} />
       )}
+
+      {screen === "customerView" && customerTenant && <CustomerView tenant={customerTenant} onBack={() => setScreen("ledger")} />}
 
       {screen === "categoryReport" && (
         <CategoryReport category={category} onBack={() => setScreen("tenantList")} />
