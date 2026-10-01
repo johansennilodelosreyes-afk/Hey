@@ -1839,13 +1839,34 @@ function CategoryReport({ category, onBack }) {
   const [expandedTenant, setExpandedTenant] = useState(null);
 
   useEffect(() => {
+    let alive = true;
+    const key = `tenants:${category}`;
     (async () => {
       try {
-        const r = await window.storage.get(`tenants:${category}`);
-        setTenants(r && r.value ? JSON.parse(r.value) : []);
-      } catch (ex) { setTenants([]); }
-      setLoaded(true);
+        const cloud = await fetchKeyFromCloud(key);
+        if (alive && Array.isArray(cloud)) {
+          setTenants(cloud);
+          await window.storage.set(key, JSON.stringify(cloud)).catch(() => {});
+        } else {
+          const r = await window.storage.get(key).catch(() => null);
+          if (alive) setTenants(r && r.value ? JSON.parse(r.value) : []);
+        }
+      } catch (ex) {
+        try {
+          const r = await window.storage.get(key);
+          if (alive) setTenants(r && r.value ? JSON.parse(r.value) : []);
+        } catch (_) { if (alive) setTenants([]); }
+      }
+      if (alive) setLoaded(true);
     })();
+    const unsubscribe = window.subscribeKeyFromCloud(key, remote => {
+      if (!alive) return;
+      const list = Array.isArray(remote) ? remote : [];
+      setTenants(list);
+      window.storage.set(key, JSON.stringify(list)).catch(() => {});
+      setLoaded(true);
+    });
+    return () => { alive = false; unsubscribe(); };
   }, [category]);
 
   const numDays = dim(year, month);
@@ -1861,12 +1882,12 @@ function CategoryReport({ category, onBack }) {
     } catch (ex) {}
     try {
       const cloudData = await fetchKeyFromCloud(key);
-      if (cloudData) {
-        localData = mergeEntries(localData, cloudData);
+      if (cloudData && typeof cloudData === "object") {
+        localData = cloudData;
         window.storage.set(key, JSON.stringify(localData)).catch(function(){});
       }
     } catch(e) {}
-    return localData;
+    return localData || {};
   };
 
   const [tenantTotals, setTenantTotals] = useState([]);
@@ -2668,6 +2689,34 @@ function DashboardScreen({ onSelectCategory, onLock, cloudStatus }) {
   );
 }
 
+function downloadCustomerTenantPdf(tenant, entries, year, month) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+  const days = dim(year, month);
+  const rows = [];
+  let due = 0, paid = 0, balance = 0;
+  for (let d = 1; d <= days; d++) {
+    const e = entries[dk(year, month, d)] || {status:null};
+    const td = rowTot(e, tenant), pd = rowPaid(e, tenant), bal = Math.max(0, td-pd);
+    if (e.status) { due += td; paid += pd; balance += bal; }
+    rows.push([`${MONTHS[month-1].slice(0,3)} ${d}`, e.status || "—", pesoPdf(td), pesoPdf(pd), pesoPdf(bal), e.coveredDate || "—", e.datePaid || "—", e.remarks || "—", e.signature ? "Signed" : "—"]);
+  }
+  doc.setFont("helvetica","bold"); doc.setFontSize(17); doc.setTextColor(27,42,74);
+  doc.text("BANAHAW FOOD PARK", 148.5, 14, {align:"center"});
+  doc.setFontSize(11); doc.text(`${tenant.name} — Customer Report`, 148.5, 21, {align:"center"});
+  doc.setFontSize(9); doc.setTextColor(90,90,90); doc.text(`${MONTHS[month-1]} ${year}`, 148.5, 27, {align:"center"});
+  doc.autoTable({startY:32,head:[["Date","Status","Amount Due","Paid","Balance","Covered Date","Date Paid","Remarks","Signature"]],body:rows,styles:{fontSize:7.5,cellPadding:2.5},headStyles:{fillColor:[27,42,74],textColor:[255,255,255]},columnStyles:{2:{halign:"right"},3:{halign:"right"},4:{halign:"right"}}});
+  const y=doc.lastAutoTable.finalY+8;
+  doc.setFont("helvetica","bold"); doc.setFontSize(9); doc.setTextColor(27,42,74);
+  doc.text(`Total Due: ${pesoPdf(due)}    Total Paid: ${pesoPdf(paid)}    Balance: ${pesoPdf(balance)}`,15,y);
+  doc.save(`${tenant.name.replace(/[^a-z0-9]+/gi,"_")}_${MONTHS[month-1]}_${year}_CustomerReport.pdf`);
+}
+
+function downloadCustomerCategoryPdf(tenant, entries, year, month) {
+  // Customer-safe category report: only the current tenant's customer-facing data is included.
+  downloadCustomerTenantPdf(tenant, entries, year, month);
+}
+
 function CustomerView({ tenant, onBack }) {
   const today = new Date();
   const [year,setYear] = useState(today.getFullYear());
@@ -2679,7 +2728,15 @@ function CustomerView({ tenant, onBack }) {
   const load = useCallback(async () => {
     let local = {};
     try { const r=await window.storage.get(storeKey); if(r&&r.value)local=JSON.parse(r.value); } catch(_) {}
-    setEntries(local);
+    // Local cache is only the instant fallback. Firebase is authoritative.
+    try {
+      const cloud = await fetchKeyFromCloud(storeKey);
+      if (cloud && typeof cloud === "object") {
+        local = cloud;
+        await window.storage.set(storeKey, JSON.stringify(cloud)).catch(() => {});
+      }
+    } catch (_) {}
+    setEntries(local || {});
   },[storeKey]);
   useEffect(()=>{load();},[load]);
   useEffect(()=>{
@@ -2707,6 +2764,11 @@ function CustomerView({ tenant, onBack }) {
     <div style={{background:`linear-gradient(135deg, ${C.navy} 0%, ${C.navyL} 100%)`,color:'#fff',padding:'24px 20px 18px'}}><div style={{maxWidth:960,margin:'0 auto'}}><button onClick={onBack} style={{background:'rgba(255,255,255,.12)',border:'1px solid rgba(255,255,255,.18)',borderRadius:8,padding:'6px 12px',color:'#fff',cursor:'pointer',marginBottom:12}}>← Back to Ledger</button><div style={{fontSize:22,fontWeight:700}}>Customer View</div><div style={{fontSize:13,opacity:.8,marginTop:4}}>{tenant.name} · {categoryLabel(tenant.category)}</div></div></div>
     <div style={{maxWidth:960,margin:'0 auto',padding:'20px'}}>
       <div style={{textAlign:'center',marginBottom:18}}><button onClick={()=>changeMonth(-1)} style={{padding:'7px 13px',border:`1px solid ${C.border}`,background:'#fff',borderRadius:8,cursor:'pointer'}}>‹</button><span style={{display:'inline-block',minWidth:170,fontWeight:700,color:C.navy}}>{MONTHS[month-1]} {year}</span><button onClick={()=>changeMonth(1)} style={{padding:'7px 13px',border:`1px solid ${C.border}`,background:'#fff',borderRadius:8,cursor:'pointer'}}>›</button></div>
+      <div style={{display:'flex',justifyContent:'center',gap:8,marginBottom:14,flexWrap:'wrap'}}>
+        <button onClick={()=>onBack()} style={{padding:'8px 14px',background:'#fff',border:`1px solid ${C.border}`,borderRadius:8,cursor:'pointer',fontSize:12}}>← Back to Ledger</button>
+        <button onClick={()=>downloadCustomerTenantPdf(tenant,entries,year,month)} style={{padding:'8px 14px',background:C.gold,color:'#fff',border:'none',borderRadius:8,cursor:'pointer',fontSize:12,fontWeight:600}}>📥 Export Customer PDF</button>
+        <button onClick={()=>downloadCustomerCategoryPdf(tenant,entries,year,month)} style={{padding:'8px 14px',background:C.navy,color:'#fff',border:'none',borderRadius:8,cursor:'pointer',fontSize:12,fontWeight:600}}>📊 Category Report</button>
+      </div>
       <div style={{background:'#fff',border:`1px solid ${C.borderL}`,borderRadius:12,overflow:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}><thead><tr style={{background:C.paper}}>{['Date','Status','Amount Due','Amount Paid','Balance','Covered Date','Date Paid','Remarks','Signature'].map(h=><th key={h} style={{padding:'10px 8px',textAlign:'left',borderBottom:`1px solid ${C.borderL}`,whiteSpace:'nowrap'}}>{h}</th>)}</tr></thead><tbody>{days.map(d=>{const e=getEntry(d);const due=rowTot(e,tenant),paid=rowPaid(e,tenant),bal=Math.max(0,due-paid);return <tr key={d}><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{MONTHS[month-1].slice(0,3)} {d}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`,color:e.status==='present'?C.green:e.status==='absent'?C.red:C.inkS,fontWeight:600}}>{e.status||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{peso(due)}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{peso(paid)}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`,color:bal>0?C.red:C.green,fontWeight:700}}>{peso(bal)}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.coveredDate||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.datePaid||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.remarks||'—'}</td><td style={{padding:'9px 8px',borderBottom:`1px solid ${C.borderL}`}}>{e.signature?<div style={{display:'flex',alignItems:'center',gap:6}}><img src={e.signature} alt="Signature" style={{height:28,maxWidth:90}}/><button onClick={()=>setSigningDate(d)} style={{fontSize:10,padding:'4px 7px',border:`1px solid ${C.border}`,background:'#fff',borderRadius:6,cursor:'pointer'}}>Edit</button></div>:<button onClick={()=>setSigningDate(d)} style={{padding:'6px 9px',background:C.navy,color:'#fff',border:'none',borderRadius:6,fontSize:11,cursor:'pointer'}}>✍️ Sign</button>}</td></tr>})}</tbody></table></div>
       <div style={{marginTop:12,fontSize:11,color:C.inkS}}>Customer View shows customer-facing information only. Internal Ayka Share and Mother Share details are not displayed.</div>
     </div>
@@ -2933,7 +2995,7 @@ function App() {
           onBack={() => setScreen("category")}
           onDelete={handleDeleteTenant}
           onLock={handleLock}
-          onCategoryReport={(cat) => setScreen("categoryReport")}
+          onCategoryReport={(cat) => { setCategory(cat); setScreen("categoryReport"); }}
           onAmbagan={(cat) => setScreen("ambagan")}
           onUnpaidTenants={(cat) => setScreen("unpaidTenants")}
         />
@@ -2969,7 +3031,25 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+class BanahawErrorBoundary extends React.Component {
+  constructor(props){ super(props); this.state={error:null}; }
+  static getDerivedStateFromError(error){ return {error:error}; }
+  componentDidCatch(error, info){ console.error("Banahaw UI error:", error, info); }
+  render(){
+    if(this.state.error){
+      return <div style={{minHeight:"100vh",background:"#FAFAF7",display:"flex",alignItems:"center",justifyContent:"center",padding:24,fontFamily:"Inter,Arial,sans-serif"}}>
+        <div style={{maxWidth:560,background:"#fff",border:"1px solid #DDD8CC",borderRadius:14,padding:24,boxShadow:"0 10px 30px rgba(0,0,0,.08)"}}>
+          <div style={{fontSize:20,fontWeight:700,color:"#1B2A4A",marginBottom:8}}>Something went wrong on this page.</div>
+          <div style={{fontSize:13,color:"#5C5C5C",lineHeight:1.6,marginBottom:14}}>The data in Firebase is safe. Reload the page and try again. If this happens again, the technical error below will help us identify the exact screen problem.</div>
+          <pre style={{whiteSpace:"pre-wrap",fontSize:11,color:"#B33025",background:"#FDE8E6",padding:12,borderRadius:8,overflow:"auto"}}>{String(this.state.error && this.state.error.stack || this.state.error)}</pre>
+          <button onClick={()=>location.reload()} style={{padding:"10px 16px",background:"#1B2A4A",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontWeight:600}}>Reload</button>
+        </div>
+      </div>;
+    }
+    return this.props.children;
+  }
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<BanahawErrorBoundary><App /></BanahawErrorBoundary>);
 </script>
 </body>
 </html>
